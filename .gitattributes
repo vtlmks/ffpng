@@ -1,0 +1,5 @@
+# stb_image.h is vendored third-party; keep it out of the language stats.
+ext/stb_image.h linguist-vendored
+
+# This is a C project; classify headers as C, not C++.
+*.h linguist-language=C
