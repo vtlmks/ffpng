@@ -1,0 +1,3 @@
+[submodule "ext/image-png"]
+	path = ext/image-png
+	url = https://github.com/image-rs/image-png.git

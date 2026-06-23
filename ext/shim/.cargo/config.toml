@@ -1,0 +1,5 @@
+# Copyright (c) 2026 Peter Fors
+# SPDX-License-Identifier: MIT
+# Match the C side's -march=native so AVX-512 codegen is fair on Zen 4.
+[build]
+rustflags = ["-C", "target-cpu=native"]

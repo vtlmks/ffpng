@@ -1,0 +1,18 @@
+# Copyright (c) 2026 Peter Fors
+# SPDX-License-Identifier: MIT
+[package]
+name = "imagepng_shim"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["staticlib"]
+
+[dependencies]
+png = { path = "../image-png", features = ["unstable"] }
+
+[profile.release]
+panic = "abort"
+opt-level = 3
+codegen-units = 1
+lto = true

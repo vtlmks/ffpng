@@ -1,0 +1,8 @@
+# Build artifacts
+/bench
+*.o
+/ext/shim/target/
+
+# Benchmark corpus: third-party QOI test images, redistribution rights unclear.
+# Not vendored here. See README.md for how to obtain and where to place them.
+/images/
