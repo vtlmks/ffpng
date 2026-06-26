@@ -1,5 +1,8 @@
 # Copyright (c) 2026 Peter Fors
 # SPDX-License-Identifier: MIT
-# Match the C side's -march=native so AVX-512 codegen is fair on Zen 4.
+# Build image-png at x86-64-v3 (AVX2), the SAME ISA as ffpng and image-png's
+# fastest configuration on Zen 4. target-cpu=native emits AVX-512, which Zen 4
+# double-pumps; measured ~9% slower than this build, so native would benchmark
+# image-png below its best. Steelman: give the competitor its fastest build.
 [build]
-rustflags = ["-C", "target-cpu=native"]
+rustflags = ["-C", "target-cpu=x86-64-v3"]

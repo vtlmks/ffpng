@@ -2,11 +2,12 @@
 
 A from-scratch C PNG decoder for x86-64, built to beat `image-rs/image-png`, the
 Rust decoder behind the 2026 ["fastest PNG decoder in the world" post](https://blog.image-rs.org/2026/06/18/png-adoption.html). Over the
-whole QOI benchmark corpus it decodes about 1.19x faster than image-png by
-geometric mean, on a Ryzen 7950X with image-png built in its strongest
-configuration, and it does so with only AVX2 against image-png's AVX-512 (see
-below). The one set it does not clearly win, the densest-entropy photographs,
-it now runs about even on (see Numbers).
+whole QOI benchmark corpus it decodes about 1.07x faster than image-png by
+geometric mean, on a Ryzen 7950X, with both decoders compiled to the same AVX2
+instruction set (`x86-64-v3`), which is image-png's fastest build on Zen 4 (see
+below). The one set it loses is the densest-entropy photographs, where the
+decode is almost entirely serial literal work and image-png's inflate edges it
+by a few percent (see Numbers).
 
 Decode only, no encoder. Output is image-png's native `EXPAND | STRIP_16`: 8-bit
 samples, channels native to the color type, for every PNG color type and bit
@@ -53,9 +54,9 @@ can no longer be back-referenced), while it is still hot in cache, instead of a
 second cold pass over the raw buffer.
 
 The per-category spread tracks how match-heavy the data is. On match-heavy data
-(textures, screenshots, icons) ffpng's inflate is comfortably ahead of
-fdeflate's; on dense-literal photographs, where the serial literal cascade is
-the whole critical path, the two are about even.
+(textures, screenshots, icons) ffpng's inflate is ahead of fdeflate's; on
+dense-literal photographs, where the serial literal cascade is the whole
+critical path, fdeflate edges it by a few percent.
 
 ## Build
 
@@ -74,30 +75,37 @@ Needs:
 changed), compiles `ffpng.o`, `ldpng.o`, and `bench.o`, and links `./bench`. The competitor is
 the genuine, unmodified `image-rs/image-png` repository, vendored as a git
 submodule at `ext/image-png` pinned to the exact commit benchmarked (`4ab5484`,
-v0.18.1). It is built with `--features=unstable` and `target-cpu=native`, its
-fastest portable-SIMD configuration, so the comparison is against image-png at
-its best, not a hobbled build.
+v0.18.1). It is built with `--features=unstable` and `target-cpu=x86-64-v3`, the
+same AVX2 instruction set as ffpng and image-png's fastest configuration on Zen 4
+(`target-cpu=native` emits AVX-512, which measured ~9% slower; see below). So the
+comparison is against image-png at its best, on equal instruction set, not a
+hobbled build.
 
 ## AVX2, not AVX-512
 
-The interesting part is *how* ffpng wins. The image-png build benchmarked above,
-its fastest, leans hard on AVX-512 when compiled `target-cpu=native` on Zen 4:
-its inflate, unfilter, and checksum code emit hundreds of AVX-512 instructions,
-including the upper `zmm16`-`zmm31` registers that exist only in AVX-512. ffpng
-emits none. It is pure AVX2 (`-march=x86-64-v3`). Both are easy to check:
+Both decoders are benchmarked as pure AVX2, and that is deliberate: on Zen 4,
+AVX-512 is a net loss for this workload. Compiled `target-cpu=native`, image-png
+emits hundreds of AVX-512 instructions, including the upper `zmm16`-`zmm31`
+registers that exist only in AVX-512; compiled `target-cpu=x86-64-v3` it emits
+none, and so does ffpng:
 
 ```sh
-objdump -d ext/shim/target/release/libimagepng_shim.a | grep -c '%zmm'   # ~950
+# the benchmarked x86-64-v3 builds: no AVX-512
+objdump -d ext/shim/target/release/libimagepng_shim.a | grep -c '%zmm'   # 0
 objdump -d ffpng.o                                     | grep -c '%zmm'   # 0
+# rebuild the shim with target-cpu=native and image-png emits ~950 zmm uses
 ```
 
-So ffpng beats an AVX-512 decoder using only AVX2, and that is the practically
-useful result. One `x86-64-v3` binary runs at full speed on every AVX2 CPU
-(Intel since 2013, AMD since 2017); reaching image-png's benchmarked numbers
-instead needs an AVX-512 build, which will not even start on those machines.
-AVX-512 was tried for ffpng and measured slower: Zen 4 double-pumps it, and the
-inflate hot loop is scalar bit-twiddling that does not widen, so giving it up
-costs nothing here and buys portability.
+The AVX-512 build of image-png runs about 9% slower on this corpus than its
+x86-64-v3 build, measured with ffpng held fixed across the two runs as a drift
+anchor (the same ffpng binary, decoding to the byte, anchors out clock and
+thermal drift between them). Zen 4 double-pumps 512-bit operations, and a PNG
+decoder is scalar bit-twiddling in the inflate hot loop plus short-vector
+unfiltering, neither of which gains from the extra width. So image-png is
+benchmarked at its faster x86-64-v3 build, not the slower native one, and ffpng
+is x86-64-v3 for the same reason. The payoff is portability with nothing left on
+the table: one binary runs at full speed on every AVX2 CPU (Intel since 2013,
+AMD since 2017), and the AVX-512 path it skips would only have been slower here.
 
 ## Benchmark
 
@@ -138,68 +146,45 @@ thermal state.
 
 ## Numbers
 
-Ryzen 7950X, single core at real-time priority, gcc 16.1, image-png v0.18.1
-`--features=unstable`, 2848 images. Sorted worst-first. `ffpng` and `image-png`
-are geomean megapixels/second; `ratio` is `ffpng / image-png`.
+Ryzen 7950X, single core at real-time priority, boost off, gcc 16.1, image-png
+v0.18.1 `--features=unstable` at `target-cpu=x86-64-v3`, 2848 images. Both
+decoders are pure AVX2. Sorted worst-first. `ffpng` and `image-png` are geomean
+megapixels/second; `ratio` is `ffpng / image-png`.
 
-Both runs below are the same binaries on the same machine, once with CPU boost
-on and once with it off. Absolute throughput moves ~20% between them, but the
-ratio does not: the overall geomean ratio is **1.190 either way**, because the
-two decoders are timed microseconds apart on the same image and rise and fall
-together with the clock. image-png's published figures are boost-on, so the
-boost-on table is the like-for-like comparison; the boost-off table is the
-fixed-clock control, included to show the ratio is not a boost artifact.
-
-Boost on (the configuration image-png's blog reports):
+The per-image ratio is independent of clock: an earlier boost-on/boost-off pair
+gave the same overall ratio to three digits, since the two decoders are timed
+microseconds apart on the same image and scale together. Only the fixed-clock
+numbers are shown.
 
 | category        | ffpng | image-png | ratio |    N |
 |-----------------|------:|----------:|------:|-----:|
-| photo_tecnick   | 257.3 |     259.1 | 0.993 |  100 |
-| textures_photo  | 194.0 |     180.5 | 1.075 |   20 |
-| photo_wikipedia | 203.9 |     188.6 | 1.081 |   49 |
-| icon_64         | 296.5 |     273.9 | 1.083 |  213 |
-| photo_kodak     | 199.0 |     182.3 | 1.092 |   24 |
-| textures_pk02   | 235.7 |     210.2 | 1.121 |  235 |
-| textures_plants | 341.2 |     300.0 | 1.137 |   60 |
-| textures_pk01   | 285.3 |     249.3 | 1.145 |  113 |
-| pngimg          | 421.9 |     366.5 | 1.151 |  187 |
-| textures_pk     | 521.3 |     438.0 | 1.190 | 1002 |
-| screenshot_game | 472.9 |     369.4 | 1.280 |  618 |
-| icon_512        | 744.6 |     550.7 | 1.352 |  213 |
-| screenshot_web  | 697.4 |     480.9 | 1.450 |   14 |
-| **overall**     | **425.3** | **357.3** | **1.190** | 2848 |
+| photo_tecnick   | 209.8 |     218.5 | 0.960 |  100 |
+| photo_wikipedia | 166.5 |     167.2 | 0.996 |   49 |
+| textures_photo  | 158.8 |     157.3 | 1.009 |   20 |
+| icon_64         | 246.9 |     240.0 | 1.029 |  213 |
+| textures_pk     | 429.3 |     412.2 | 1.041 | 1002 |
+| photo_kodak     | 163.4 |     155.5 | 1.051 |   24 |
+| textures_plants | 275.1 |     259.2 | 1.061 |   60 |
+| pngimg          | 345.7 |     323.9 | 1.067 |  187 |
+| textures_pk02   | 191.8 |     179.0 | 1.071 |  235 |
+| textures_pk01   | 232.9 |     214.6 | 1.085 |  113 |
+| screenshot_game | 384.8 |     345.9 | 1.112 |  618 |
+| icon_512        | 606.4 |     502.3 | 1.207 |  213 |
+| screenshot_web  | 584.6 |     398.9 | 1.466 |   14 |
+| **overall**     | **348.4** | **325.2** | **1.071** | 2848 |
 
-Boost off (fixed clock):
-
-| category        | ffpng | image-png | ratio |    N |
-|-----------------|------:|----------:|------:|-----:|
-| photo_tecnick   | 209.5 |     213.9 | 0.979 |  100 |
-| textures_photo  | 159.4 |     149.1 | 1.069 |   20 |
-| photo_wikipedia | 166.5 |     155.3 | 1.072 |   49 |
-| icon_64         | 246.3 |     227.7 | 1.082 |  213 |
-| photo_kodak     | 163.6 |     150.8 | 1.085 |   24 |
-| textures_pk02   | 192.5 |     172.8 | 1.114 |  235 |
-| textures_plants | 277.9 |     246.5 | 1.127 |   60 |
-| textures_pk01   | 232.0 |     205.0 | 1.132 |  113 |
-| pngimg          | 346.5 |     300.5 | 1.153 |  187 |
-| textures_pk     | 428.9 |     357.4 | 1.200 | 1002 |
-| screenshot_game | 386.1 |     302.6 | 1.276 |  618 |
-| icon_512        | 606.6 |     451.3 | 1.344 |  213 |
-| screenshot_web  | 591.8 |     398.9 | 1.484 |   14 |
-| **overall**     | **348.7** | **293.0** | **1.190** | 2848 |
-
-The honest read: `photo_tecnick` is the only category not clearly ahead, and it
-now sits at parity (~0.99, within run-to-run drift). It is the densest-literal
-set in the corpus (1200x1200 RGB, only ~1.8x compressible), so its decode is
-almost entirely the inflate literal cascade; matching fdeflate's entry layout,
-which keeps each cascade step to a single shift, brought it from a clear loss up
-to even. The two highest-weight categories, `textures_pk` (35% of the corpus)
-and `screenshot_game` (22%), carry the geomean.
+The honest read: `photo_tecnick` and `photo_wikipedia` are the two categories
+ffpng does not win. They are the densest-literal sets in the corpus (tecnick is
+1200x1200 RGB, only ~1.8x compressible), so the decode is almost entirely the
+serial Huffman literal chain, and there fdeflate is a few percent faster.
+Everything else is a win, carried by the two highest-weight categories,
+`textures_pk` (35% of the corpus) and `screenshot_game` (22%).
 
 ## The limit
 
-After matching fdeflate's table layout, `photo_tecnick` sits at parity rather
-than ahead, and that is the floor. Dense-literal data is decoded by a serial
+After matching fdeflate's table layout, `photo_tecnick` is within a few percent
+of image-png instead of far behind, but it does not pass it, and that is the
+floor. Dense-literal data is decoded by a serial
 recurrence: a symbol's position in the bitstream is known only once the previous
 symbol's code length has been decoded, so the table loads form a dependent chain
 of roughly one L1 latency per literal. The speculative cascade overlaps those
