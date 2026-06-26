@@ -23,18 +23,21 @@ struct bitreader {
 // canonical maxcode/firstcode fallback for the rare long ones.
 #define FAST_BITS 9
 #define FAST12_BITS 12
-// Combined big-image table entry. `op` (bits 0-2) is dual purpose: it is the
-// kind AND, for literals, the output advance (1 or 2), so `pos += op` needs no
-// extra extraction. Code bits sit in the HIGH byte (bits 24-31) so the address
-// chain (bitbuf >> code_bits) extracts them with a single shift. Both fields
-// thus cost one op on their respective loop-carried chains (cf. fdeflate):
-//   op 0 = long code (>12 bits, entry == 0): per-symbol path
-//   op 1 = one literal:  byte0 in bits 3-10
-//   op 2 = two literals: byte0 in bits 3-10, byte1 in bits 11-18
-//   op 3 = match:        extra bits in 3-5, length base in 6-15
-//   op 4 = end of block
+// Combined big-image table entry. The CODE LENGTH sits in the LOW byte (bits
+// 0-7, always <= 12) so it is usable directly as a shift count: the cascade's
+// `bitbuf >> (uint8_t)entry` is one shrx with no extraction, keeping the
+// loop-carried literal-decode chain as short as fdeflate's (the kind/advance
+// fields below are read only off the non-critical output and match chains):
+//   entry == 0      = long code (>12 bits): per-symbol path
+//   bit 15 (LIT)    = literal: advance (1|2) in 8-9, len1 in 10-13 (pair, for
+//                     the cold tail), byte0 in 16-23, byte1 in 24-31
+//   bit 14 (EOB)    = end of block
+//   else            = match: extra bits in 8-10, length base in 16-24, length
+//                     symbol index in 25-29 (for the cold tail)
 // Combined distance entry (9-bit lookup, big images): code bits in 0-3, extra
 // bits in 4-7, distance base in 8-22; 0 == code longer than 9 bits (canonical).
+#define COMB_LIT 0x8000u
+#define COMB_EOB 0x4000u
 struct huff {
 	uint16_t fast[1 << FAST_BITS];	// 0 == long code; else (length << 9) | symbol
 	uint32_t comb[1 << FAST12_BITS];	// big-image combined table (see above)
@@ -345,15 +348,15 @@ static int huff_build(struct huff *h, uint8_t *lengths, uint32_t num, int mode) 
 				uint32_t idx = bit_reverse16(cw, len);
 				uint32_t centry;
 				if(i < 256) {
-					centry = 1u | (i << 3) | (len << 24);
+					centry = COMB_LIT | (1u << 8) | ((uint32_t)i << 16) | len;
 				} else if(i == 256) {
-					centry = 4u | (len << 24);
+					centry = COMB_EOB | len;
 				} else if(i - 257 < 29) {
 					uint32_t li = i - 257;
-					// li in bits 16-20 (free; hot loop reads only base at 6-15,
-					// extra at 3-5, code bits at 24+) lets the cold tail recover
-					// the length symbol without a canonical lookup.
-					centry = 3u | ((uint32_t)length_extra[li] << 3) | ((uint32_t)length_base[li] << 6) | (li << 16) | (len << 24);
+					// li in bits 25-29 (free; the hot loop reads only base at 16-24,
+					// extra at 8-10, code length in the low byte) lets the cold tail
+					// recover the length symbol without a canonical lookup.
+					centry = ((uint32_t)length_extra[li] << 8) | ((uint32_t)length_base[li] << 16) | (li << 25) | len;
 				} else {
 					centry = 0;
 				}
@@ -373,10 +376,10 @@ static int huff_build(struct huff *h, uint8_t *lengths, uint32_t num, int mode) 
 					for(uint32_t b = offset[len2]; b < end2; ++b) {
 						uint32_t sym2 = sorted[b];
 						uint32_t idx = codes[sym1] | ((uint32_t)codes[sym2] << len1);
-						// len1 in bits 19-22 (free; the hot loop ignores them) lets
+						// len1 in bits 10-13 (free; the hot loop ignores them) lets
 						// the cold tail recover the first literal's code length
-						// without a canonical search.
-						h->comb[idx] = 2u | (sym1 << 3) | (sym2 << 11) | (len1 << 19) | (len << 24);
+						// without a canonical search. cb (low byte) = len = len1+len2.
+						h->comb[idx] = COMB_LIT | (2u << 8) | ((uint32_t)len1 << 10) | ((uint32_t)sym1 << 16) | ((uint32_t)sym2 << 24) | len;
 					}
 				}
 			}
@@ -439,24 +442,25 @@ static inline int huff_decode_full(struct bitreader *b, struct huff *h) {
 		refill(b);
 	}
 	uint32_t e = h->comb[b->bitbuf & ((1u << FAST12_BITS) - 1)];
-	uint32_t op = e & 7;
-	if(op == 1 || op == 2) {
-		uint32_t s = op == 2 ? ((e >> 19) & 0xf) : (e >> 24);
+	if(e & COMB_LIT) {
+		// A fused pair returns its first literal and consumes only len1, leaving
+		// the second for the next call; a single consumes the whole code length.
+		uint32_t s = ((e >> 8) & 3) == 2 ? ((e >> 10) & 0xf) : (uint8_t)e;
 		b->bitbuf >>= s;
 		b->bitcnt -= s;
-		return (int)((e >> 3) & 0xff);
+		return (int)((e >> 16) & 0xff);
 	}
-	if(op == 4) {
-		b->bitbuf >>= e >> 24;
-		b->bitcnt -= e >> 24;
+	if(e & COMB_EOB) {
+		b->bitbuf >>= (uint8_t)e;
+		b->bitcnt -= (uint8_t)e;
 		return 256;
 	}
-	if(op == 3) {
-		b->bitbuf >>= e >> 24;
-		b->bitcnt -= e >> 24;
-		return (int)(257 + ((e >> 16) & 0x1f));
+	if(e) {
+		b->bitbuf >>= (uint8_t)e;
+		b->bitcnt -= (uint8_t)e;
+		return (int)(257 + ((e >> 25) & 0x1f));
 	}
-	// op == 0: code longer than 12 bits; canonical search from 13.
+	// entry == 0: code longer than 12 bits; canonical search from 13.
 	uint32_t key = bit_reverse16((uint32_t)(b->bitbuf & 0xffff), 16);
 	uint32_t s = 13;
 	while((int32_t)key >= h->maxcode[s]) {
@@ -1040,58 +1044,52 @@ static int inflate_block(struct bitreader *restrict b, struct huff *lit, struct 
 					}
 				}
 				while(b->in + 8 <= b->end && pos + 8 <= chunk_end) {
-					uint32_t cb1 = e1 >> 24;
-					if((e1 & 7) == 1 || (e1 & 7) == 2) {	// literal (op == output advance)
-						uint32_t e2 = lit->comb[(b->bitbuf >> cb1) & ((1u << FAST12_BITS) - 1)];
-						uint32_t cb2 = e2 >> 24;
-						uint32_t e3 = lit->comb[(b->bitbuf >> (cb1 + cb2)) & ((1u << FAST12_BITS) - 1)];
-						uint32_t cb3 = e3 >> 24;
-						uint32_t e4 = lit->comb[(b->bitbuf >> (cb1 + cb2 + cb3)) & ((1u << FAST12_BITS) - 1)];
-						// One 16-bit store per literal entry, not two byte stores:
-						// (uint16_t)(e>>3) is lit1 | lit2<<8, and halving the
-						// store-queue entries cuts 4K-alias STLF conflicts between
-						// these output stores and the comb-table loads.
-						uint16_t v1 = (uint16_t)(e1 >> 3);
+					if(e1 & COMB_LIT) {	// literal: low-byte code length feeds the cascade directly
+						// Code length is the low byte, usable as a shift count with no extraction,
+						// so each speculative look-ahead index is one shrx (cf. fdeflate). Issue the
+						// next three loads from the unconsumed buffer at cumulative code-bit offsets.
+						uint32_t e2 = lit->comb[(b->bitbuf >> (uint8_t)e1) & ((1u << FAST12_BITS) - 1)];
+						uint32_t e3 = lit->comb[(b->bitbuf >> ((uint8_t)e1 + (uint8_t)e2)) & ((1u << FAST12_BITS) - 1)];
+						uint32_t e4 = lit->comb[(b->bitbuf >> ((uint8_t)e1 + (uint8_t)e2 + (uint8_t)e3)) & ((1u << FAST12_BITS) - 1)];
+						uint16_t v1 = (uint16_t)(e1 >> 16);
 						memcpy(out + pos, &v1, 2);
-						pos += e1 & 7;
-						if((e2 & 7) == 1 || (e2 & 7) == 2) {
-							uint16_t v2 = (uint16_t)(e2 >> 3);
+						pos += (e1 >> 8) & 3;
+						if(e2 & COMB_LIT) {
+							uint16_t v2 = (uint16_t)(e2 >> 16);
 							memcpy(out + pos, &v2, 2);
-							pos += e2 & 7;
-							if((e3 & 7) == 1 || (e3 & 7) == 2) {
-								uint16_t v3 = (uint16_t)(e3 >> 3);
+							pos += (e2 >> 8) & 3;
+							if(e3 & COMB_LIT) {
+								uint16_t v3 = (uint16_t)(e3 >> 16);
 								memcpy(out + pos, &v3, 2);
-								pos += e3 & 7;
-								b->bitbuf >>= cb1 + cb2 + cb3;
-								b->bitcnt -= cb1 + cb2 + cb3;
+								pos += (e3 >> 8) & 3;
+								b->bitbuf >>= (uint8_t)e1 + (uint8_t)e2 + (uint8_t)e3;
+								b->bitcnt -= (uint8_t)e1 + (uint8_t)e2 + (uint8_t)e3;
 								e1 = e4;
 								refill(b);
 								continue;
 							}
-							b->bitbuf >>= cb1 + cb2;
-							b->bitcnt -= cb1 + cb2;
+							b->bitbuf >>= (uint8_t)e1 + (uint8_t)e2;
+							b->bitcnt -= (uint8_t)e1 + (uint8_t)e2;
 							e1 = e3;
 						} else {
-							b->bitbuf >>= cb1;
-							b->bitcnt -= cb1;
+							b->bitbuf >>= (uint8_t)e1;
+							b->bitcnt -= (uint8_t)e1;
 							e1 = e2;
 						}
 						refill(b);
-						cb1 = e1 >> 24;
 					}
-					// e1 is now a match, end-of-block, or long code (op in {0,3,4}).
-					uint32_t op = e1 & 7;
-					if(op == 0) {
+					// e1 is now a match, end-of-block, or long code (entry == 0).
+					if(e1 == 0) {
 						break;	// code longer than 12 bits, use the per-symbol path.
 					}
-					b->bitbuf >>= cb1;
-					b->bitcnt -= cb1;
-					if(op == 4) {	// end of block
+					b->bitbuf >>= (uint8_t)e1;
+					b->bitcnt -= (uint8_t)e1;
+					if(e1 & COMB_EOB) {	// end of block
 						*outpos = pos;
 						return 0;
 					}
 					// match
-					size_t length = ((e1 >> 6) & 0x3ff) + getbits(b, (e1 >> 3) & 7);
+					size_t length = ((e1 >> 16) & 0x1ff) + getbits(b, (e1 >> 8) & 7);
 					uint32_t de = dist->dist_comb[b->bitbuf & ((1u << FAST_BITS) - 1)];
 					size_t distance;
 					if(de) {

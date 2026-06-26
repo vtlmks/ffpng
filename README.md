@@ -2,11 +2,11 @@
 
 A from-scratch C PNG decoder for x86-64, built to beat `image-rs/image-png`, the
 Rust decoder behind the 2026 "fastest PNG decoder in the world" post. Over the
-whole QOI benchmark corpus it decodes about 1.18x faster than image-png by
+whole QOI benchmark corpus it decodes about 1.19x faster than image-png by
 geometric mean, on a Ryzen 7950X with image-png built in its strongest
 configuration, and it does so with only AVX2 against image-png's AVX-512 (see
-below). It is not faster on every image: on dense, high-entropy photographs it
-still loses (see Numbers).
+below). The one set it does not clearly win, the densest-entropy photographs,
+it now runs about even on (see Numbers).
 
 Decode only, no encoder. Output is image-png's native `EXPAND | STRIP_16`: 8-bit
 samples, channels native to the color type, for every PNG color type and bit
@@ -27,7 +27,10 @@ length base, or end-of-block. The literal path runs a four-deep speculative
 cascade: the next three table loads are issued from the still-unconsumed bit
 buffer so their L1 latencies pipeline, and up to three literals are emitted
 before one consume-and-refill. This structure is modeled on `fdeflate`,
-image-png's inflate backend.
+image-png's inflate backend. Each entry keeps its code length in the low byte,
+so advancing the bit buffer to the next speculative load is a single shift with
+no extraction: the serial literal-decode chain, which is the whole cost on
+dense-literal photographs, stays one shift per symbol.
 
 The combined table is built by incremental doubling: each symbol is placed once
 at its codeword, adjacent literal pairs are fused, and the table is doubled with
@@ -49,11 +52,10 @@ soon as it falls a full 32 KB window behind the inflate write frontier (so it
 can no longer be back-referenced), while it is still hot in cache, instead of a
 second cold pass over the raw buffer.
 
-The cascade's trade-off shows up in the per-category numbers. On match-heavy
-data (textures, screenshots, icons) ffpng's inflate is faster than fdeflate's;
-on dense-literal photographs it is a few percent slower, because the literal
-cascade is then the critical path and ffpng extracts slightly less
-instruction-level parallelism per load.
+The per-category spread tracks how match-heavy the data is. On match-heavy data
+(textures, screenshots, icons) ffpng's inflate is comfortably ahead of
+fdeflate's; on dense-literal photographs, where the serial literal cascade is
+the whole critical path, the two are about even.
 
 ## Build
 
@@ -139,27 +141,28 @@ are geomean megapixels/second; `ratio` is `ffpng / image-png`.
 
 | category        | ffpng | image-png | ratio |    N |
 |-----------------|------:|----------:|------:|-----:|
-| photo_tecnick   | 254.3 |     259.9 | 0.978 |  100 |
-| textures_photo  | 191.5 |     181.7 | 1.054 |   20 |
-| photo_wikipedia | 201.2 |     189.0 | 1.065 |   49 |
-| photo_kodak     | 194.8 |     182.1 | 1.070 |   24 |
-| textures_pk02   | 229.2 |     210.3 | 1.090 |  235 |
-| icon_64         | 298.1 |     273.1 | 1.092 |  213 |
-| textures_plants | 332.7 |     300.2 | 1.108 |   60 |
-| textures_pk01   | 280.5 |     249.0 | 1.126 |  113 |
-| pngimg          | 416.1 |     366.5 | 1.135 |  187 |
-| textures_pk     | 523.0 |     439.9 | 1.189 | 1002 |
-| screenshot_game | 464.2 |     369.0 | 1.258 |  618 |
-| icon_512        | 738.4 |     550.9 | 1.340 |  213 |
-| screenshot_web  | 693.8 |     481.6 | 1.441 |   14 |
-| **overall**     | **421.7** | **357.8** | **1.179** | 2848 |
+| photo_tecnick   | 257.3 |     259.1 | 0.993 |  100 |
+| textures_photo  | 194.0 |     180.5 | 1.075 |   20 |
+| photo_wikipedia | 203.9 |     188.6 | 1.081 |   49 |
+| icon_64         | 296.5 |     273.9 | 1.083 |  213 |
+| photo_kodak     | 199.0 |     182.3 | 1.092 |   24 |
+| textures_pk02   | 235.7 |     210.2 | 1.121 |  235 |
+| textures_plants | 341.2 |     300.0 | 1.137 |   60 |
+| textures_pk01   | 285.3 |     249.3 | 1.145 |  113 |
+| pngimg          | 421.9 |     366.5 | 1.151 |  187 |
+| textures_pk     | 521.3 |     438.0 | 1.190 | 1002 |
+| screenshot_game | 472.9 |     369.4 | 1.280 |  618 |
+| icon_512        | 744.6 |     550.7 | 1.352 |  213 |
+| screenshot_web  | 697.4 |     480.9 | 1.450 |   14 |
+| **overall**     | **425.3** | **357.3** | **1.190** | 2848 |
 
-The honest read: `photo_tecnick` is the one category we lose, by ~2%. It is the
-densest-literal set in the corpus (1200x1200 RGB, only ~1.8x compressible), so
-its decode is almost entirely the inflate literal cascade, and there fdeflate
-edges us. The two highest-weight categories, `textures_pk` (35% of the corpus)
-and `screenshot_game` (22%), are both wins and carry the geomean. Everything
-except `photo_tecnick` is faster than image-png.
+The honest read: `photo_tecnick` is the only category not clearly ahead, and it
+now sits at parity (~0.99, within run-to-run drift). It is the densest-literal
+set in the corpus (1200x1200 RGB, only ~1.8x compressible), so its decode is
+almost entirely the inflate literal cascade; matching fdeflate's entry layout,
+which keeps each cascade step to a single shift, brought it from a clear loss up
+to even. The two highest-weight categories, `textures_pk` (35% of the corpus)
+and `screenshot_game` (22%), carry the geomean.
 
 ## Layout
 
