@@ -71,6 +71,10 @@ Needs:
 - `libpng` and `zlib` (the benchmark also times libpng as a reference)
 - `libdeflate` and `libspng` (two more reference decoders the benchmark times)
 
+Use gcc for the numbers above. ffpng compiles cleanly with clang too, but on
+this workload clang runs about 10% slower: it schedules the SIMD unfilter worse
+and inlines the match path less aggressively than gcc.
+
 `build.sh` builds the image-png shim staticlib with cargo (a no-op when nothing
 changed), compiles `ffpng.o`, `ldpng.o`, and `bench.o`, and links `./bench`. The competitor is
 the genuine, unmodified `image-rs/image-png` repository, vendored as a git
