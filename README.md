@@ -195,11 +195,15 @@ of roughly one L1 latency per literal. The speculative cascade overlaps those
 latencies as far as the buffered bits allow, but the load addresses are
 themselves dependent, since each index needs the prior symbol's length, so the
 chain cannot be flattened. fdeflate hits the same wall; matching its entry layout
-closed the gap to it but does not go past it. The only known way through is
-decoding more than one symbol per load (a multi-symbol table), which no
-production DEFLATE decoder does, and which trades a larger table and a heavier
-per-block build for the win. That trade is unfavourable on the many-block
-photographs where it would matter.
+closed most of the gap, and the few percent that remain are not algorithmic. The
+same recurrence compiled with clang, the LLVM that also compiles fdeflate, runs a
+few percent faster than with gcc, so the residual is GCC-versus-LLVM codegen on
+this one loop, not a missing optimisation; ffpng ships gcc because it is about
+10% faster across the rest of the corpus. The only way past the recurrence itself
+is decoding more than one symbol per load (a multi-symbol table), which no
+production DEFLATE decoder does and which cannot pay for its build here: the
+per-block table would be 16x larger, while each dynamic block in these
+photographs decodes only about 30,000 literals, far too few to amortise it.
 
 On match-heavy data there is measured headroom: a decoder using libdeflate's
 inflate as a drop-in (same front end, same unfilter) is faster than ffpng on the
