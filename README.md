@@ -2,7 +2,7 @@
 
 A from-scratch C PNG decoder for x86-64, built to beat `image-rs/image-png`, the
 Rust decoder behind the 2026 "fastest PNG decoder in the world" post. Over the
-whole QOI benchmark corpus it decodes about 1.17x faster than image-png by
+whole QOI benchmark corpus it decodes about 1.18x faster than image-png by
 geometric mean, on a Ryzen 7950X with image-png built in its strongest
 configuration, and it does so with only AVX2 against image-png's AVX-512 (see
 below). It is not faster on every image: on dense, high-entropy photographs it
@@ -104,10 +104,25 @@ python3 analyze.py FILE          # per-category ratios from a CSV
 ```
 
 Pin to one core at real-time priority, and disable CPU boost, for stable
-numbers. `bench` registers four decoders (image-png, this one, stb_image,
-libpng), times each on every image, and verifies correctness: the first decoder
-(image-png) is the oracle; every other decoder's output is converted to
-canonical RGBA8 outside the timing loop and `memcmp`'d against it.
+numbers. `bench` registers four decoders, times each on every image, and
+verifies correctness: the first decoder (image-png) is the oracle; every other
+decoder's output is converted to canonical RGBA8 outside the timing loop and
+`memcmp`'d against it.
+
+Without `--decoder`, all four run. `--decoder NAME` restricts the run to one,
+where `NAME` is one of:
+
+| `NAME`      | decoder                                |
+|-------------|----------------------------------------|
+| `image-png` | image-rs/image-png (the oracle)        |
+| `ffpng`     | this decoder                           |
+| `stb_image` | stb_image.h                            |
+| `libpng`    | libpng + zlib                          |
+
+The other flags: `--csv FILE` writes per-image results, `--filter SUBSTR` keeps
+only paths containing `SUBSTR`, `--limit N` caps the corpus to the first `N`
+images, and `--min-time-ms` / `--min-iters` / `--max-iters` tune the per-image
+timing budget.
 
 Timing is decode only, the geometric mean of per-image megapixels/second over
 many iterations per image; per-decode allocation is inside the timed region
@@ -124,22 +139,22 @@ are geomean megapixels/second; `ratio` is `ffpng / image-png`.
 
 | category        | ffpng | image-png | ratio |    N |
 |-----------------|------:|----------:|------:|-----:|
-| photo_tecnick   | 213.9 |     220.9 | 0.968 |  100 |
-| photo_wikipedia | 166.7 |     156.4 | 1.066 |   49 |
-| textures_photo  | 159.5 |     149.1 | 1.070 |   20 |
-| icon_64         | 245.6 |     228.0 | 1.077 |  213 |
-| photo_kodak     | 160.9 |     148.6 | 1.083 |   24 |
-| textures_pk02   | 188.1 |     172.0 | 1.094 |  235 |
-| textures_plants | 272.9 |     244.3 | 1.117 |   60 |
-| textures_pk01   | 228.9 |     203.3 | 1.126 |  113 |
-| pngimg          | 340.7 |     298.9 | 1.140 |  187 |
-| textures_pk     | 429.2 |     367.2 | 1.169 | 1002 |
-| screenshot_game | 374.4 |     300.9 | 1.244 |  618 |
-| icon_512        | 586.0 |     447.4 | 1.310 |  213 |
-| screenshot_web  | 597.2 |     400.9 | 1.490 |   14 |
-| **overall**     | **344.4** | **295.2** | **1.167** | 2848 |
+| photo_tecnick   | 254.3 |     259.9 | 0.978 |  100 |
+| textures_photo  | 191.5 |     181.7 | 1.054 |   20 |
+| photo_wikipedia | 201.2 |     189.0 | 1.065 |   49 |
+| photo_kodak     | 194.8 |     182.1 | 1.070 |   24 |
+| textures_pk02   | 229.2 |     210.3 | 1.090 |  235 |
+| icon_64         | 298.1 |     273.1 | 1.092 |  213 |
+| textures_plants | 332.7 |     300.2 | 1.108 |   60 |
+| textures_pk01   | 280.5 |     249.0 | 1.126 |  113 |
+| pngimg          | 416.1 |     366.5 | 1.135 |  187 |
+| textures_pk     | 523.0 |     439.9 | 1.189 | 1002 |
+| screenshot_game | 464.2 |     369.0 | 1.258 |  618 |
+| icon_512        | 738.4 |     550.9 | 1.340 |  213 |
+| screenshot_web  | 693.8 |     481.6 | 1.441 |   14 |
+| **overall**     | **421.7** | **357.8** | **1.179** | 2848 |
 
-The honest read: `photo_tecnick` is the one category we lose, by ~3%. It is the
+The honest read: `photo_tecnick` is the one category we lose, by ~2%. It is the
 densest-literal set in the corpus (1200x1200 RGB, only ~1.8x compressible), so
 its decode is almost entirely the inflate literal cascade, and there fdeflate
 edges us. The two highest-weight categories, `textures_pk` (35% of the corpus)

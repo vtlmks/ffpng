@@ -512,9 +512,8 @@ static inline int huff_decode_nf(struct bitreader *b, struct huff *h) {
 static inline void copy_match(uint8_t *out, size_t pos, size_t distance, size_t length) {
 	uint8_t *src = out + pos - distance;
 	uint8_t *dst = out + pos;
-	if(distance == 1) {
-		memset(dst, src[0], length);
-	} else if(distance >= 16) {
+	uint8_t *end = dst + length;
+	if(distance >= 16) {
 		// The common case (short non-overlapping match, or any match whose
 		// distance is >= the 16-byte vector width): copy in unconditional
 		// 16-byte stores with no length branch and no memcpy call. The first
@@ -526,19 +525,31 @@ static inline void copy_match(uint8_t *out, size_t pos, size_t distance, size_t 
 		for(size_t i = 16; i < length; i += 16) {
 			_mm_storeu_si128((__m128i *)(dst + i), _mm_loadu_si128((__m128i *)(src + i)));
 		}
+	} else if(distance >= 8) {
+		// distance 8..15: each 8-byte source window sits fully behind the write
+		// frontier (distance >= 8), so unconditional 8-byte word stores advancing
+		// by 8 are non-overlapping and need no doubling (cf. libdeflate's
+		// offset >= WORDBYTES path). Over-write past `end` lands in COPY_PAD.
+		do {
+			memcpy(dst, src, 8);
+			src += 8;
+			dst += 8;
+		} while(dst < end);
+	} else if(distance == 1) {
+		memset(dst, src[0], length);
 	} else {
-		// Small-distance overlap (2..15): seed `distance` bytes, then grow by
-		// repeatedly doubling the already-written run. Every copy is
-		// non-overlapping, which avoids the partial store-to-load-forward stalls
-		// a misaligned wordwise overlap copy would hit, and stays O(log length)
-		// for the long runs this branch handles.
-		memcpy(dst, src, distance);
-		size_t filled = distance;
-		while(filled < length) {
-			size_t n = filled < length - filled ? filled : length - filled;
-			memcpy(dst + filled, dst, n);
-			filled += n;
-		}
+		// distance 2..7 (RGB/RGBA pixel-stride repeats are the hot case): inline
+		// branchless overlapping 8-byte stores advancing by `distance`. Each
+		// store writes 8 bytes but commits only `distance` forward; later
+		// overlapping stores propagate the period and correct the slop, so the
+		// final bytes are exact (cf. libdeflate's offset-stride path). Reads of
+		// not-yet-final bytes stay within `out`+COPY_PAD and are overwritten
+		// before they are read as output.
+		do {
+			memcpy(dst, src, 8);
+			src += distance;
+			dst += distance;
+		} while(dst < end);
 	}
 }
 
@@ -1101,10 +1112,16 @@ static int inflate_block(struct bitreader *restrict b, struct huff *lit, struct 
 						*outpos = pos;
 						return -1;
 					}
-					copy_match(out, pos, distance, length);
-					pos += length;
+					// Refill and preload the next litlen entry BEFORE issuing the
+					// match copy, so the copy's store latency overlaps this
+					// independent next-iteration setup instead of serializing
+					// after it (cf. libdeflate's fastloop). bitbuf is already in
+					// its final post-distance state, so the preloaded entry is
+					// identical to loading it after the copy.
 					refill(b);
 					e1 = lit->comb[b->bitbuf & ((1u << FAST12_BITS) - 1)];
+					copy_match(out, pos, distance, length);
+					pos += length;
 				}
 				if(b->in + 8 <= b->end && pos + 8 <= chunk_end) {
 					break;	// long code (op == 0): hand to the per-symbol path.
