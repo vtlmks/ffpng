@@ -1,7 +1,7 @@
 # ffpng
 
 A from-scratch C PNG decoder for x86-64, built to beat `image-rs/image-png`, the
-Rust decoder behind the 2026 "fastest PNG decoder in the world" post. Over the
+Rust decoder behind the 2026 ["fastest PNG decoder in the world" post](https://blog.image-rs.org/2026/06/18/png-adoption.html). Over the
 whole QOI benchmark corpus it decodes about 1.19x faster than image-png by
 geometric mean, on a Ryzen 7950X with image-png built in its strongest
 configuration, and it does so with only AVX2 against image-png's AVX-512 (see
@@ -68,9 +68,10 @@ Needs:
 - `gcc` (tested 16.1) targeting `x86-64-v3` (AVX2 + BMI2) with PCLMUL
 - Rust `nightly` + `cargo` (image-png's `unstable` feature requires it)
 - `libpng` and `zlib` (the benchmark also times libpng as a reference)
+- `libdeflate` and `libspng` (two more reference decoders the benchmark times)
 
 `build.sh` builds the image-png shim staticlib with cargo (a no-op when nothing
-changed), compiles `ffpng.o` and `bench.o`, and links `./bench`. The competitor is
+changed), compiles `ffpng.o`, `ldpng.o`, and `bench.o`, and links `./bench`. The competitor is
 the genuine, unmodified `image-rs/image-png` repository, vendored as a git
 submodule at `ext/image-png` pinned to the exact commit benchmarked (`4ab5484`,
 v0.18.1). It is built with `--features=unstable` and `target-cpu=native`, its
@@ -106,20 +107,22 @@ python3 analyze.py FILE          # per-category ratios from a CSV
 ```
 
 Pin to one core at real-time priority, and disable CPU boost, for stable
-numbers. `bench` registers four decoders, times each on every image, and
+numbers. `bench` registers six decoders, times each on every image, and
 verifies correctness: the first decoder (image-png) is the oracle; every other
 decoder's output is converted to canonical RGBA8 outside the timing loop and
 `memcmp`'d against it.
 
-Without `--decoder`, all four run. `--decoder NAME` restricts the run to one,
+Without `--decoder`, all six run. `--decoder NAME` restricts the run to one,
 where `NAME` is one of:
 
-| `NAME`      | decoder                                |
-|-------------|----------------------------------------|
-| `image-png` | image-rs/image-png (the oracle)        |
-| `ffpng`     | this decoder                           |
-| `stb_image` | stb_image.h                            |
-| `libpng`    | libpng + zlib                          |
+| `NAME`      | decoder                                       |
+|-------------|-----------------------------------------------|
+| `image-png` | image-rs/image-png (the oracle)               |
+| `ffpng`     | this decoder                                  |
+| `ldpng`     | libdeflate's inflate behind this decoder's front end |
+| `libspng`   | libspng (miniz inflate)                       |
+| `stb_image` | stb_image.h                                   |
+| `libpng`    | libpng + zlib                                 |
 
 The other flags: `--csv FILE` writes per-image results, `--filter SUBSTR` keeps
 only paths containing `SUBSTR`, `--limit N` caps the corpus to the first `N`
@@ -220,8 +223,9 @@ is not the fastest possible inflate on every kind of data.
 
 ```
 ffpng.c  ffpng.h    the decoder (one TU; libc + immintrin only)
+ldpng.c             reference decoder: libdeflate's inflate, ffpng's front end
 bench.c             benchmark driver: registers decoders, times, checks output
-build.sh            builds the shim, then ffpng.o + bench
+build.sh            builds the shim, then ffpng.o + ldpng.o + bench
 analyze.py          per-category ratios from a bench CSV
 ext/image-png/      genuine image-rs/image-png, git submodule pinned at 4ab5484
 ext/shim/           Rust staticlib wrapping image-png for the C benchmark
