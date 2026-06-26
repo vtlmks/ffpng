@@ -19,7 +19,10 @@ DECFLAGS="-std=c99 -O2 -march=x86-64-v3 -mbmi -mbmi2 -mpclmul \
 	-U_FORTIFY_SOURCE -Wall -Wextra"
 
 cc $DECFLAGS -c ffpng.c -o ffpng.o
+# Reference decoder: ffpng front-end + libdeflate inflate (includes ffpng.c, so
+# same DECFLAGS). Built alongside ffpng to isolate the inflate engine.
+cc $DECFLAGS -c ldpng.c -o ldpng.o
 cc -O2 -march=native -Wall -Wextra -c bench.c -o bench.o
-cc -no-pie -Wl,--gc-sections -o bench bench.o ffpng.o \
+cc -no-pie -Wl,--gc-sections -o bench bench.o ffpng.o ldpng.o \
 	ext/shim/target/release/libimagepng_shim.a \
-	-lpng -lz -lm -lpthread -ldl
+	-lpng -lz -lm -lpthread -ldl -ldeflate -lspng

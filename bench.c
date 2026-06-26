@@ -26,6 +26,7 @@
 #include <sys/stat.h>
 
 #include <png.h>
+#include <spng.h>
 
 #include "ffpng.h"
 
@@ -328,12 +329,73 @@ static void ffpng_free(struct decode_result *r) {
 	free(r->pixels);
 }
 
+// [=]===^=[ ldpng (libdeflate inflate, ffpng front-end) ]=====================[=]
+// Reference decoder: ffpng's exact chunk parse + unfilter + expand, with the
+// inflate engine swapped to a single libdeflate_zlib_decompress call. A
+// head-to-head vs ffpng isolates the inflate engine. Defined in ldpng.c.
+extern int ldpng_decode(uint8_t *data, size_t len, struct pd_image *out);
+
+static int ldpng_dec(uint8_t *data, size_t len, struct decode_result *out) {
+	struct pd_image img;
+	if(ldpng_decode(data, len, &img) != 0) {
+		return 1;
+	}
+	out->pixels = img.pixels;
+	out->width = img.width;
+	out->height = img.height;
+	out->channels = img.channels;
+	return 0;
+}
+
+// [=]===^=[ libspng ]=========================================================[=]
+// Independent real-world decoder (miniz inflate, not libdeflate). Decoded to
+// RGBA8 (its universal target), which matches the oracle after to_rgba8; tRNS
+// is applied so alpha lines up. The forced RGBA8 materialization is work ffpng
+// does outside the timed path, so spng's number carries that asymmetry on
+// RGB/gray inputs - it is a real-decoder reference, not an apples-to-apples
+// inflate comparison (ldpng is that).
+static int spng_dec(uint8_t *data, size_t len, struct decode_result *out) {
+	spng_ctx *ctx = spng_ctx_new(0);
+	if(!ctx) {
+		return 1;
+	}
+	struct spng_ihdr ihdr;
+	size_t size;
+	if(spng_set_png_buffer(ctx, data, len) != 0 || spng_get_ihdr(ctx, &ihdr) != 0 || spng_decoded_image_size(ctx, SPNG_FMT_RGBA8, &size) != 0) {
+		spng_ctx_free(ctx);
+		return 1;
+	}
+	uint8_t *p = malloc(size);
+	if(!p) {
+		spng_ctx_free(ctx);
+		return 1;
+	}
+	if(spng_decode_image(ctx, p, size, SPNG_FMT_RGBA8, SPNG_DECODE_TRNS) != 0) {
+		free(p);
+		spng_ctx_free(ctx);
+		return 1;
+	}
+	spng_ctx_free(ctx);
+	out->pixels = p;
+	out->width = ihdr.width;
+	out->height = ihdr.height;
+	out->channels = 4;
+	return 0;
+}
+
+// [=]===^=[ spng_free ]=======================================================[=]
+static void spng_free(struct decode_result *r) {
+	free(r->pixels);
+}
+
 // [=]===^=[ decoders ]========================================================[=]
 // The first decoder is the correctness oracle; image-png defines the EXPAND
 // output we must reproduce.
 static struct decoder decoders[] = {
 	{ .name = "image-png", .decode = imagepng_dec, .free_pixels = imagepng_free_result },
 	{ .name = "ffpng", .decode = ffpng_decode, .free_pixels = ffpng_free },
+	{ .name = "ldpng", .decode = ldpng_dec, .free_pixels = ffpng_free },
+	{ .name = "libspng", .decode = spng_dec, .free_pixels = spng_free },
 	{ .name = "stb_image", .decode = stb_decode, .free_pixels = stb_free },
 	{ .name = "libpng", .decode = libpng_decode, .free_pixels = libpng_free },
 };
