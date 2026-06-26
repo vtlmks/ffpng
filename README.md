@@ -139,6 +139,16 @@ Ryzen 7950X, single core at real-time priority, gcc 16.1, image-png v0.18.1
 `--features=unstable`, 2848 images. Sorted worst-first. `ffpng` and `image-png`
 are geomean megapixels/second; `ratio` is `ffpng / image-png`.
 
+Both runs below are the same binaries on the same machine, once with CPU boost
+on and once with it off. Absolute throughput moves ~20% between them, but the
+ratio does not: the overall geomean ratio is **1.190 either way**, because the
+two decoders are timed microseconds apart on the same image and rise and fall
+together with the clock. image-png's published figures are boost-on, so the
+boost-on table is the like-for-like comparison; the boost-off table is the
+fixed-clock control, included to show the ratio is not a boost artifact.
+
+Boost on (the configuration image-png's blog reports):
+
 | category        | ffpng | image-png | ratio |    N |
 |-----------------|------:|----------:|------:|-----:|
 | photo_tecnick   | 257.3 |     259.1 | 0.993 |  100 |
@@ -156,6 +166,25 @@ are geomean megapixels/second; `ratio` is `ffpng / image-png`.
 | screenshot_web  | 697.4 |     480.9 | 1.450 |   14 |
 | **overall**     | **425.3** | **357.3** | **1.190** | 2848 |
 
+Boost off (fixed clock):
+
+| category        | ffpng | image-png | ratio |    N |
+|-----------------|------:|----------:|------:|-----:|
+| photo_tecnick   | 209.5 |     213.9 | 0.979 |  100 |
+| textures_photo  | 159.4 |     149.1 | 1.069 |   20 |
+| photo_wikipedia | 166.5 |     155.3 | 1.072 |   49 |
+| icon_64         | 246.3 |     227.7 | 1.082 |  213 |
+| photo_kodak     | 163.6 |     150.8 | 1.085 |   24 |
+| textures_pk02   | 192.5 |     172.8 | 1.114 |  235 |
+| textures_plants | 277.9 |     246.5 | 1.127 |   60 |
+| textures_pk01   | 232.0 |     205.0 | 1.132 |  113 |
+| pngimg          | 346.5 |     300.5 | 1.153 |  187 |
+| textures_pk     | 428.9 |     357.4 | 1.200 | 1002 |
+| screenshot_game | 386.1 |     302.6 | 1.276 |  618 |
+| icon_512        | 606.6 |     451.3 | 1.344 |  213 |
+| screenshot_web  | 591.8 |     398.9 | 1.484 |   14 |
+| **overall**     | **348.7** | **293.0** | **1.190** | 2848 |
+
 The honest read: `photo_tecnick` is the only category not clearly ahead, and it
 now sits at parity (~0.99, within run-to-run drift). It is the densest-literal
 set in the corpus (1200x1200 RGB, only ~1.8x compressible), so its decode is
@@ -163,6 +192,29 @@ almost entirely the inflate literal cascade; matching fdeflate's entry layout,
 which keeps each cascade step to a single shift, brought it from a clear loss up
 to even. The two highest-weight categories, `textures_pk` (35% of the corpus)
 and `screenshot_game` (22%), carry the geomean.
+
+## The limit
+
+After matching fdeflate's table layout, `photo_tecnick` sits at parity rather
+than ahead, and that is the floor. Dense-literal data is decoded by a serial
+recurrence: a symbol's position in the bitstream is known only once the previous
+symbol's code length has been decoded, so the table loads form a dependent chain
+of roughly one L1 latency per literal. The speculative cascade overlaps those
+latencies as far as the buffered bits allow, but the load addresses are
+themselves dependent, since each index needs the prior symbol's length, so the
+chain cannot be flattened. fdeflate hits the same wall; matching its entry layout
+closed the gap to it but does not go past it. The only known way through is
+decoding more than one symbol per load (a multi-symbol table), which no
+production DEFLATE decoder does, and which trades a larger table and a heavier
+per-block build for the win. That trade is unfavourable on the many-block
+photographs where it would matter.
+
+On match-heavy data there is measured headroom: a decoder using libdeflate's
+inflate as a drop-in (same front end, same unfilter) is faster than ffpng on the
+match-dense categories. That gap is in libdeflate's loop structure, not any
+single operation; attempts to port it either netted nothing or cost more on the
+literal path than they saved. So ffpng beats image-png across the corpus, but it
+is not the fastest possible inflate on every kind of data.
 
 ## Layout
 
