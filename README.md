@@ -172,10 +172,16 @@ SMT lane would share execution ports and add noise.
 percent between runs, so comparing one decoder's MP/s before and after a change
 is unreliable. The fix is to never compare across runs. Both things under
 comparison are timed in the same run, microseconds apart on the same image, and
-only their per-image ratio is reported. Clock, thermal, and layout drift are
-common-mode: they hit both identically and cancel in the ratio. The harness does
-this for ffpng against image-png; the same trick A/Bs two versions of one decoder
-(register both, alternate per image, take the ratio). The anchor is strong enough
+only their per-image ratio is reported. Clock and thermal are time-varying global
+state: in the microseconds between timing the two decoders they affect whichever
+is running, and over many iterations both see the same distribution, so they
+cancel in the ratio. Code layout does not cancel, being fixed per binary and not
+shared, so each decoder's alignment and branch-aliasing land in the ratio rather
+than washing out. The harness does this for ffpng against image-png; the same
+trick A/Bs two versions of one decoder (register both, alternate per image, take
+the ratio), with the caveat that a layout shift between the two versions is then
+part of the measured delta, not noise the anchor removes. The anchor is strong
+enough
 that the comparison does not even need a fixed clock: the overall ratio comes out
 to three digits with CPU boost on and off, though the absolute numbers move about
 20% between them. So the core isolation and boost-off above are there to steady
@@ -190,11 +196,12 @@ figure.
 
 **Wall-clock, not instruction counts.** The bottleneck here is a latency-bound
 recurrence: each Huffman table load's address depends on the previous load's
-result (see The limit). Instruction-count and cachegrind-style models assume a
-fixed cost per instruction and systematically misjudge such dependent-load
-chains, which is why their estimated-cycle deltas drift away from real runtime.
-Wall-clock on an isolated core, read through the ratio, measures what actually
-moves.
+result (see The limit). Instruction-count tools, and even cachegrind-style models
+that do count cache hits and misses, do not model out-of-order execution: they
+score the recurrence's L1-hit loads as cheap and overlappable and miss that each
+is serialized at load-use latency behind the previous one. That is why their
+estimated-cycle deltas drift away from real runtime. Wall-clock on an isolated
+core, read through the ratio, measures what actually moves.
 
 ## Numbers
 
