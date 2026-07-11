@@ -39,7 +39,7 @@ struct bitreader {
 #define COMB_LIT 0x8000u
 #define COMB_EOB 0x4000u
 struct huff {
-	uint16_t fast[1 << FAST_BITS];	// 0 == long code; else (length << 9) | symbol
+	uint16_t fast[1 << FAST_BITS];
 	uint32_t comb[1 << FAST12_BITS];	// big-image combined table (see above)
 	uint32_t dist_comb[1 << FAST_BITS];	// big-image combined distance table
 	uint16_t firstcode[16];
@@ -251,9 +251,7 @@ static inline uint32_t bit_reverse16(uint32_t v, uint32_t bits) {
 }
 
 // [=]===^=[ huff_build ]======================================================[=]
-// `mode` builds an extra combined table for large images (the build cost
-// amortizes): 1 == the 12-bit literal/length comb, 2 == the 9-bit distance comb.
-// Small images keep just the cheap 9-bit fast table.
+// `mode` selects the literal comb, distance comb, or packed small distance table.
 static int huff_build(struct huff *h, uint8_t *lengths, uint32_t num, int mode) {
 	uint32_t sizes[17] = { 0 };
 	uint32_t next_code[16];
@@ -298,7 +296,11 @@ static int huff_build(struct huff *h, uint8_t *lengths, uint32_t num, int mode) 
 			if(mode != 1 && s <= FAST_BITS) {
 				uint32_t j = bit_reverse16(next_code[s], s);
 				while(j < (1u << FAST_BITS)) {
-					h->fast[j] = (uint16_t)((s << 9) | i);
+					if(mode == 3) {
+						h->fast[j] = (uint16_t)(s | ((uint32_t)dist_extra[i] << 4) | (i << 8));
+					} else {
+						h->fast[j] = (uint16_t)((s << 9) | i);
+					}
 					j += 1u << s;
 				}
 			}
@@ -570,6 +572,56 @@ static inline int do_match(struct bitreader *b, uint32_t sym, struct huff *dist,
 		return -1;
 	}
 	size_t distance = dist_base[dsym] + getbits(b, dist_extra[dsym]);
+	if(distance > *pos || *pos + length > outsize) {
+		return -1;
+	}
+	copy_match(out, *pos, distance, length);
+	*pos += length;
+	return 0;
+}
+
+// [=]===^=[ do_match_small ]==================================================[=]
+__attribute__((always_inline))
+static inline int do_match_small(struct bitreader *b, uint32_t sym, struct huff *dist, uint8_t *out, size_t *pos, size_t outsize) {
+	uint32_t li = sym - 257;
+	if(li >= 29) {
+		return -1;
+	}
+	size_t length = length_base[li] + getbits(b, length_extra[li]);
+	if(b->bitcnt < 16) {
+		refill(b);
+	}
+	uint32_t de = dist->fast[b->bitbuf & ((1u << FAST_BITS) - 1)];
+	size_t distance;
+	if(de) {
+		uint32_t dcb = de & 15;
+		uint32_t dex = (de >> 4) & 15;
+		uint32_t dsym = de >> 8;
+		uint32_t base = dsym < 4 ? dsym + 1 : 1 + ((2 | (dsym & 1)) << dex);
+		b->bitbuf >>= dcb;
+		b->bitcnt -= dcb;
+		distance = base + getbits(b, dex);
+	} else {
+		uint32_t key = bit_reverse16((uint32_t)(b->bitbuf & 0xffff), 16);
+		uint32_t s = FAST_BITS + 1;
+		while((int32_t)key >= dist->maxcode[s]) {
+			++s;
+		}
+		if(s >= 16) {
+			return -1;
+		}
+		uint32_t idx = (key >> (16 - s)) - dist->firstcode[s] + dist->firstsymbol[s];
+		if(idx >= 288 || dist->size[idx] != s) {
+			return -1;
+		}
+		uint32_t dsym = dist->value[idx];
+		if(dsym >= 30) {
+			return -1;
+		}
+		b->bitbuf >>= s;
+		b->bitcnt -= s;
+		distance = dist_base[dsym] + getbits(b, dist_extra[dsym]);
+	}
 	if(distance > *pos || *pos + length > outsize) {
 		return -1;
 	}
@@ -1158,7 +1210,7 @@ static int inflate_block(struct bitreader *restrict b, struct huff *lit, struct 
 				*outpos = pos;
 				return -1;
 			}
-			if(do_match(b, (uint32_t)sym, dist, out, &pos, outsize)) {
+			if(do_match_small(b, (uint32_t)sym, dist, out, &pos, outsize)) {
 				*outpos = pos;
 				return -1;
 			}
@@ -1181,7 +1233,7 @@ static int inflate_block(struct bitreader *restrict b, struct huff *lit, struct 
 			*outpos = pos;
 			return 0;
 		}
-		if(do_match(b, (uint32_t)sym, dist, out, &pos, outsize)) {
+		if(big ? do_match(b, (uint32_t)sym, dist, out, &pos, outsize) : do_match_small(b, (uint32_t)sym, dist, out, &pos, outsize)) {
 			*outpos = pos;
 			return -1;
 		}
@@ -1210,7 +1262,7 @@ static void inflate_fixed_tables(struct huff *lit, struct huff *dist, int big) {
 	for(i = 0; i < 30; ++i) {
 		dlengths[i] = 5;
 	}
-	huff_build(dist, dlengths, 30, big ? 2 : 0);
+	huff_build(dist, dlengths, 30, big ? 2 : 3);
 }
 
 // [=]===^=[ inflate_dynamic_tables ]==========================================[=]
@@ -1260,7 +1312,7 @@ static int inflate_dynamic_tables(struct bitreader *b, struct huff *lit, struct 
 		}
 	}
 
-	if(huff_build(lit, lengths, hlit, big) != 0 || huff_build(dist, lengths + hlit, hdist, big ? 2 : 0) != 0) {
+	if(huff_build(lit, lengths, hlit, big) != 0 || huff_build(dist, lengths + hlit, hdist, big ? 2 : 3) != 0) {
 		return -1;
 	}
 	return 0;
@@ -1298,8 +1350,16 @@ static int inflate_stream(uint8_t *in, size_t inlen, uint8_t *out, size_t outsiz
 			if(len > b.bitcnt / 8 + (size_t)(b.end - b.in)) {
 				return -1;
 			}
-			for(uint32_t i = 0; i < len; ++i) {
+			uint32_t buffered = len < b.bitcnt / 8 ? len : b.bitcnt / 8;
+			for(uint32_t i = 0; i < buffered; ++i) {
 				out[outpos++] = (uint8_t)getbits(&b, 8);
+			}
+			uint32_t remaining = len - buffered;
+			if(remaining) {
+				b.bitbuf = 0;
+				memcpy(out + outpos, b.in, remaining);
+				b.in += remaining;
+				outpos += remaining;
 			}
 		} else if(btype == 1 || btype == 2) {
 			struct huff lit, dist;
