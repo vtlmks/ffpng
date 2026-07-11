@@ -2,12 +2,11 @@
 
 A from-scratch C PNG decoder for x86-64, built to beat `image-rs/image-png`, the
 Rust decoder behind the 2026 ["fastest PNG decoder in the world" post](https://blog.image-rs.org/2026/06/18/png-adoption.html). Over the
-whole QOI benchmark corpus it decodes about 1.07x faster than image-png by
+whole QOI benchmark corpus it decodes about 1.12x faster than image-png by
 geometric mean, on a Ryzen 7950X, with both decoders compiled to the same AVX2
 instruction set (`x86-64-v3`), which is image-png's fastest build on Zen 4 (see
-below). The one set it loses is the densest-entropy photographs, where the
-decode is almost entirely serial literal work and image-png's inflate edges it
-by a few percent (see Numbers).
+below). It wins all 13 corpus categories; the closest are the densest-entropy
+photographs, where decode is almost entirely serial literal work (see Numbers).
 
 Decode only, no encoder. Output is image-png's native `EXPAND | STRIP_16`: 8-bit
 samples, channels native to the color type, for every PNG color type and bit
@@ -31,7 +30,10 @@ before one consume-and-refill. This structure is modeled on `fdeflate`,
 image-png's inflate backend. Each entry keeps its code length in the low byte,
 so advancing the bit buffer to the next speculative load is a single shift with
 no extraction: the serial literal-decode chain, which is the whole cost on
-dense-literal photographs, stays one shift per symbol.
+dense-literal photographs, stays one shift per symbol. On large streams whose
+raw-to-compressed ratio is below 2.5, the fourth speculative lookup is delayed
+until the first three entries have proved to be literals. That shortens its live
+range on dense data without selecting by image category, dimensions, or name.
 
 The combined table is built by incremental doubling: each symbol is placed once
 at its codeword, adjacent literal pairs are fused, and the table is doubled with
@@ -53,10 +55,10 @@ soon as it falls a full 32 KB window behind the inflate write frontier (so it
 can no longer be back-referenced), while it is still hot in cache, instead of a
 second cold pass over the raw buffer.
 
-The per-category spread tracks how match-heavy the data is. On match-heavy data
-(textures, screenshots, icons) ffpng's inflate is ahead of fdeflate's; on
-dense-literal photographs, where the serial literal cascade is the whole
-critical path, fdeflate edges it by a few percent.
+The per-category spread tracks how match-heavy the data is. Match-heavy data
+(textures, screenshots, icons) exercises the match loop; dense-literal
+photographs are limited by the serial literal cascade. ffpng is ahead of
+image-png in both regimes, but by only about 3% on the two densest photo sets.
 
 ## Build
 
@@ -148,6 +150,9 @@ portable, machine-independent comparison, since both decoders are timed
 microseconds apart on the same image; absolute MP/s vary with CPU and boost or
 thermal state.
 
+The published table uses the command above without timing overrides: 50 ms per
+image, at least 5 iterations and at most 2000 iterations, for all six decoders.
+
 ## Measurement
 
 Small changes are hard to measure because run-to-run noise (clock drift, thermal,
@@ -217,55 +222,56 @@ numbers are shown.
 
 | category        | ffpng | image-png | ratio |    N |
 |-----------------|------:|----------:|------:|-----:|
-| photo_tecnick   | 209.8 |     218.5 | 0.960 |  100 |
-| photo_wikipedia | 166.5 |     167.2 | 0.996 |   49 |
-| textures_photo  | 158.8 |     157.3 | 1.009 |   20 |
-| icon_64         | 246.9 |     240.0 | 1.029 |  213 |
-| textures_pk     | 429.3 |     412.2 | 1.041 | 1002 |
-| photo_kodak     | 163.4 |     155.5 | 1.051 |   24 |
-| textures_plants | 275.1 |     259.2 | 1.061 |   60 |
-| pngimg          | 345.7 |     323.9 | 1.067 |  187 |
-| textures_pk02   | 191.8 |     179.0 | 1.071 |  235 |
-| textures_pk01   | 232.9 |     214.6 | 1.085 |  113 |
-| screenshot_game | 384.8 |     345.9 | 1.112 |  618 |
-| icon_512        | 606.4 |     502.3 | 1.207 |  213 |
-| screenshot_web  | 584.6 |     398.9 | 1.466 |   14 |
-| **overall**     | **348.4** | **325.2** | **1.071** | 2848 |
+| photo_tecnick   | 225.3 |     218.4 | 1.031 |  100 |
+| photo_wikipedia | 172.2 |     166.8 | 1.032 |   49 |
+| textures_photo  | 162.8 |     157.1 | 1.037 |   20 |
+| icon_64         | 251.4 |     237.1 | 1.060 |  213 |
+| photo_kodak     | 167.1 |     155.9 | 1.072 |   24 |
+| pngimg          | 358.2 |     326.8 | 1.096 |  187 |
+| textures_pk02   | 196.1 |     178.7 | 1.097 |  235 |
+| textures_plants | 284.5 |     259.2 | 1.098 |   60 |
+| textures_pk01   | 240.5 |     217.4 | 1.106 |  113 |
+| textures_pk     | 436.3 |     391.3 | 1.115 | 1002 |
+| screenshot_game | 390.8 |     343.8 | 1.137 |  618 |
+| icon_512        | 619.3 |     512.6 | 1.208 |  213 |
+| screenshot_web  | 681.3 |     434.2 | 1.569 |   14 |
+| **overall**     | **356.3** | **319.5** | **1.115** | 2848 |
 
-The honest read: `photo_tecnick` and `photo_wikipedia` are the two categories
-ffpng does not win. They are the densest-literal sets in the corpus (tecnick is
-1200x1200 RGB, only ~1.8x compressible), so the decode is almost entirely the
-serial Huffman literal chain, and there fdeflate is a few percent faster.
-Everything else is a win, carried by the two highest-weight categories,
-`textures_pk` (35% of the corpus) and `screenshot_game` (22%).
+The honest read: ffpng wins every category, but `photo_tecnick` and
+`photo_wikipedia` are only about 3% ahead. They are the densest-literal sets in
+the corpus (tecnick is 1200x1200 RGB, only about 1.8x compressible), so decode is
+almost entirely the serial Huffman literal chain. The two highest-weight
+categories, `textures_pk` (35% of the corpus) and `screenshot_game` (22%), win by
+11.5% and 13.7%.
+
+The dense-stream schedule was also checked after selection on an independently
+generated eight-image holdout: random RGB, grayscale, and RGBA noise, plasma,
+gradient, checkerboard, and radial-gradient PNGs with unseen dimensions. At the
+same 50 ms budget it improved the holdout geomean by 3.2% and 3.8% in the two
+decoder orders. Every dense/random image improved by 3.7% to 9.2%. The repeated
+tradeoff was a 0.5% to 0.7% loss on the highly compressible checkerboard, where
+ffpng remained 31% ahead of image-png. The holdout is a generalization check,
+not part of the published QOI aggregate.
 
 ## The limit
 
-After matching fdeflate's table layout, `photo_tecnick` is within a few percent
-of image-png instead of far behind, but it does not pass it, and that is the
-floor. Dense-literal data is decoded by a serial
-recurrence: a symbol's position in the bitstream is known only once the previous
-symbol's code length has been decoded, so the table loads form a dependent chain
-of roughly one L1 latency per literal. The speculative cascade overlaps those
-latencies as far as the buffered bits allow, but the load addresses are
-themselves dependent, since each index needs the prior symbol's length, so the
-chain cannot be flattened. fdeflate hits the same wall; matching its entry layout
-closed most of the gap, and the few percent that remain are not algorithmic. The
-same recurrence compiled with clang, the LLVM that also compiles fdeflate, runs a
-few percent faster than with gcc, so the residual is GCC-versus-LLVM codegen on
-this one loop, not a missing optimisation; ffpng ships gcc because it is about
-10% faster across the rest of the corpus. The only way past the recurrence itself
-is decoding more than one symbol per load (a multi-symbol table), which no
-production DEFLATE decoder does and which cannot pay for its build here: the
-per-block table would be 16x larger, while each dynamic block in these
-photographs decodes only about 30,000 literals, far too few to amortise it.
+Dense-literal data is limited by a serial recurrence: a symbol's position in the
+bitstream is known only after the previous symbol's code length, so the Huffman
+table-load addresses form a dependent chain dominated by L1 load-use latency.
+Delaying the fourth lookup reduces live-range pressure but does not remove that
+dependency. ffpng reaches 225.3 MP/s on `photo_tecnick`, 103.1% of image-png's
+measured 218.4 MP/s, but that competitor ratio is not a hardware roofline. No
+port-pressure or load-latency roofline has been established, so further gains in
+this loop remain possible.
 
-On match-heavy data there is measured headroom: a decoder using libdeflate's
-inflate as a drop-in (same front end, same unfilter) is faster than ffpng on the
-match-dense categories. That gap is in libdeflate's loop structure, not any
-single operation; attempts to port it either netted nothing or cost more on the
-literal path than they saved. So ffpng beats image-png across the corpus, but it
-is not the fastest possible inflate on every kind of data.
+Match-heavy data has separately measured headroom. The same front end using
+libdeflate inflate reaches 510.2 MP/s on `textures_pk` against ffpng's 436.3,
+putting ffpng at 85.5% of that measured implementation bound; on
+`screenshot_game` it is at 93.6%. The remaining limiter there is the match-loop
+dependency and control structure rather than literal-table latency. Attempts to
+port pieces of libdeflate's loop have either netted nothing or charged more to
+the literal path than they saved, but the measured gap remains an optimization
+target.
 
 ## Layout
 

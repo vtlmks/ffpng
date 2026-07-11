@@ -664,10 +664,10 @@ static inline void store4(uint8_t *p, __m128i res) {
 static inline void store3(uint8_t *p, __m128i res) {
 	// One word store + one byte store, not three byte stores: a 4-byte store
 	// would clobber the next pixel's not-yet-read raw input byte at p[3].
-	int t = _mm_cvtsi128_si32(_mm_packus_epi16(res, res));
-	uint16_t lo = (uint16_t)t;
+	res = _mm_packus_epi16(res, res);
+	uint16_t lo = (uint16_t)_mm_extract_epi16(res, 0);
 	memcpy(p, &lo, 2);
-	p[2] = (uint8_t)(t >> 16);
+	p[2] = (uint8_t)_mm_extract_epi8(res, 2);
 }
 
 // [=]===^=[ unfilter_up ]=====================================================[=]
@@ -759,10 +759,9 @@ static void sub_simd_bpp3(uint8_t *cur, size_t n) {
 		int ct;
 		memcpy(&ct, cur + i, 4);
 		__m128i res = _mm_add_epi8(_mm_cvtsi32_si128(ct), a);
-		int rt = _mm_cvtsi128_si32(res);
-		uint16_t lo = (uint16_t)rt;
+		uint16_t lo = (uint16_t)_mm_extract_epi16(res, 0);
 		memcpy(cur + i, &lo, 2);
-		cur[i + 2] = (uint8_t)(rt >> 16);
+		cur[i + 2] = (uint8_t)_mm_extract_epi8(res, 2);
 		a = res;
 	}
 	for(; i < n; ++i) {
@@ -1064,12 +1063,13 @@ static int sink_consume(struct sink *s, size_t pos, size_t window) {
 }
 
 // [=]===^=[ inflate_block ]===================================================[=]
-// Decodes one block. Large images (`big`) use a 12-bit table that resolves codes
+// Decodes one block. Large images (`big != 0`) use a 12-bit table that resolves codes
 // up to 12 bits and emits up to two literals per iteration; small images use the
 // cheap 9-bit table and a three-literal-per-refill loop. Both fall back to a
 // per-symbol path for long codes and near the buffer ends. When `sink` is set
 // (non-interlaced large images) the big path streams completed rows through the
 // fused unfilter/expand consumer at chunk boundaries, keeping `raw` cache-hot.
+// Mode 2 delays the fourth lookup until the first three entries prove literal.
 static int inflate_block(struct bitreader *restrict b, struct huff *lit, struct huff *dist, uint8_t *restrict out, size_t outsize, size_t *outpos, int big, struct sink *sink) {
 	size_t pos = *outpos;
 	for(;;) {
@@ -1102,7 +1102,10 @@ static int inflate_block(struct bitreader *restrict b, struct huff *lit, struct 
 						// next three loads from the unconsumed buffer at cumulative code-bit offsets.
 						uint32_t e2 = lit->comb[(b->bitbuf >> (uint8_t)e1) & ((1u << FAST12_BITS) - 1)];
 						uint32_t e3 = lit->comb[(b->bitbuf >> ((uint8_t)e1 + (uint8_t)e2)) & ((1u << FAST12_BITS) - 1)];
-						uint32_t e4 = lit->comb[(b->bitbuf >> ((uint8_t)e1 + (uint8_t)e2 + (uint8_t)e3)) & ((1u << FAST12_BITS) - 1)];
+						uint32_t e4 = 0;
+						if(__builtin_expect(big == 1, 1)) {
+							e4 = lit->comb[(b->bitbuf >> ((uint8_t)e1 + (uint8_t)e2 + (uint8_t)e3)) & ((1u << FAST12_BITS) - 1)];
+						}
 						uint16_t v1 = (uint16_t)(e1 >> 16);
 						memcpy(out + pos, &v1, 2);
 						pos += (e1 >> 8) & 3;
@@ -1111,6 +1114,9 @@ static int inflate_block(struct bitreader *restrict b, struct huff *lit, struct 
 							memcpy(out + pos, &v2, 2);
 							pos += (e2 >> 8) & 3;
 							if(e3 & COMB_LIT) {
+								if(big > 1) {
+									e4 = lit->comb[(b->bitbuf >> ((uint8_t)e1 + (uint8_t)e2 + (uint8_t)e3)) & ((1u << FAST12_BITS) - 1)];
+								}
 								uint16_t v3 = (uint16_t)(e3 >> 16);
 								memcpy(out + pos, &v3, 2);
 								pos += (e3 >> 8) & 3;
@@ -1256,7 +1262,7 @@ static void inflate_fixed_tables(struct huff *lit, struct huff *dist, int big) {
 	for(; i < 288; ++i) {
 		lengths[i] = 8;
 	}
-	huff_build(lit, lengths, 288, big);
+	huff_build(lit, lengths, 288, big ? 1 : 0);
 
 	uint8_t dlengths[30];
 	for(i = 0; i < 30; ++i) {
@@ -1312,16 +1318,16 @@ static int inflate_dynamic_tables(struct bitreader *b, struct huff *lit, struct 
 		}
 	}
 
-	if(huff_build(lit, lengths, hlit, big) != 0 || huff_build(dist, lengths + hlit, hdist, big ? 2 : 3) != 0) {
+	if(huff_build(lit, lengths, hlit, big ? 1 : 0) != 0 || huff_build(dist, lengths + hlit, hdist, big ? 2 : 3) != 0) {
 		return -1;
 	}
 	return 0;
 }
 
 // [=]===^=[ inflate_stream ]====================================================[=]
-// Decompresses a zlib stream into a buffer of exactly `outsize` bytes. `big`
-// selects the high-throughput 12-bit literal tables (worth it once the output is
-// large enough to amortize the bigger table build).
+// Decompresses a zlib stream into a buffer of exactly `outsize` bytes. Nonzero
+// `big` selects the high-throughput 12-bit tables; mode 2 selects the dense-stream
+// literal schedule.
 static int inflate_stream(uint8_t *in, size_t inlen, uint8_t *out, size_t outsize, int big, struct sink *sink) {
 	if(inlen < 2) {
 		return -1;
@@ -1567,7 +1573,8 @@ int pd_decode(uint8_t *data, size_t len, struct pd_image *out) {
 		// non-streaming path, the final sub-window tail for the big path).
 		struct sink sink = { raw, pixels, 0, plte, trns, pal32_ptr, stride, row_bytes, 0, height, width, bpp, bd, out_ch, eff_trns, ct };
 		struct sink *sp = raw_size > STREAM_MIN ? &sink : 0;
-		if(!raw || inflate_stream(idat, idat_len, raw, raw_size, raw_size >= BIG_MIN, sp) != 0 || sink_consume(&sink, raw_size, 0) != 0) {
+		int big = raw_size >= BIG_MIN ? (raw_size / 5 < idat_len / 2 ? 2 : 1) : 0;
+		if(!raw || inflate_stream(idat, idat_len, raw, raw_size, big, sp) != 0 || sink_consume(&sink, raw_size, 0) != 0) {
 			if(raw_owned) {
 				free(raw);
 			}
@@ -1600,7 +1607,8 @@ int pd_decode(uint8_t *data, size_t len, struct pd_image *out) {
 		int raw_owned = raw_size < RAW_REUSE_MIN;
 		uint8_t *raw = raw_owned ? malloc(raw_size + COPY_PAD) : raw_grow(raw_size);
 		uint8_t *temp = malloc((size_t)maxw * out_ch);
-		if(!raw || !temp || inflate_stream(idat, idat_len, raw, raw_size, raw_size >= BIG_MIN, 0) != 0) {
+		int big = raw_size >= BIG_MIN ? (raw_size / 5 < idat_len / 2 ? 2 : 1) : 0;
+		if(!raw || !temp || inflate_stream(idat, idat_len, raw, raw_size, big, 0) != 0) {
 			if(raw_owned) {
 				free(raw);
 			}
