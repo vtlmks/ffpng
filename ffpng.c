@@ -1,9 +1,5 @@
 // Copyright (c) 2026 Peter Fors
 // SPDX-License-Identifier: MIT
-//
-// PNG decoder. Self-contained DEFLATE/zlib inflate (64-bit refill, two-level
-// Huffman tables), slicing-by-16 CRC, SSE/AVX2 unfiltering, and EXPAND|STRIP_16
-// output for every color type and bit depth.
 
 #include "ffpng.h"
 #include <stdlib.h>
@@ -19,56 +15,29 @@ struct bitreader {
 	uint32_t bitcnt;
 };
 
-// Two-level Huffman: a FAST_BITS-wide direct table for short codes, with a
-// canonical maxcode/firstcode fallback for the rare long ones.
 #define FAST_BITS 9
 #define FAST12_BITS 12
-// Combined big-image table entry. The CODE LENGTH sits in the LOW byte (bits
-// 0-7, always <= 12) so it is usable directly as a shift count: the cascade's
-// `bitbuf >> (uint8_t)entry` is one shrx with no extraction, keeping the
-// loop-carried literal-decode chain as short as fdeflate's (the kind/advance
-// fields below are read only off the non-critical output and match chains):
-//   entry == 0      = long code (>12 bits): per-symbol path
-//   bit 15 (LIT)    = literal: advance (1|2) in 8-9, len1 in 10-13 (pair, for
-//                     the cold tail), byte0 in 16-23, byte1 in 24-31
-//   bit 14 (EOB)    = end of block
-//   else            = match: extra bits in 8-10, length base in 16-24, length
-//                     symbol index in 25-29 (for the cold tail)
-// Combined distance entry (9-bit lookup, big images): code bits in 0-3, extra
-// bits in 4-7, distance base in 8-22; 0 == code longer than 9 bits (canonical).
+// comb packs code length in 0..7, literal advance in 8..9, pair length in 10..13, EOB/LIT in 14/15, payload in 16..31; zero selects canonical decoding.
 #define COMB_LIT 0x8000u
 #define COMB_EOB 0x4000u
 struct huff {
 	uint16_t fast[1 << FAST_BITS];
-	uint32_t comb[1 << FAST12_BITS];	// big-image combined table (see above)
-	uint32_t dist_comb[1 << FAST_BITS];	// big-image combined distance table
+	uint32_t comb[1 << FAST12_BITS];
+	uint32_t dist_comb[1 << FAST_BITS];
 	uint16_t firstcode[16];
 	int32_t maxcode[17];
 	uint16_t firstsymbol[16];
-	uint8_t size[288];		// code length per canonical index
-	uint16_t value[288];		// symbol per canonical index
+	uint8_t size[288];
+	uint16_t value[288];
 };
 
-// Streaming consumer state for the fused inflate -> unfilter -> expand pipeline
-// on the non-interlaced path. As inflate writes filtered rows into `raw` (which
-// doubles as the DEFLATE window), rows that have fallen at least one 32 KB window
-// behind the write frontier can no longer be back-referenced, so they are
-// unfiltered in place and expanded to `pixels` while still hot in L2, instead of
-// a second full cold pass over `raw`. `crow` is the next row to consume; `prev`
-// is the previous reconstructed row (the unfilter predictor source).
+// Rows beyond the DEFLATE window are safe to mutate and consume while still resident in L2.
 #define INFLATE_WINDOW 32768
 
-// Drain a chunk this large before handing rows to the consumer. It must be well
-// above the 16 KB comb table so that reloading the table after each consumer
-// burst (the consumer's SIMD unfilter/expand evicts it) amortizes to nothing;
-// 8 KB chunks measurably regressed the moderate, inflate-bound images.
+// 128 KB amortizes comb-table reloads; 8 KB regressed moderate inflate-bound images.
 #define STREAM_CHUNK (128 * 1024)
 
-// Stream only once `raw` is larger than the last-level cache, so the alternative
-// (a separate full unfilter pass) would genuinely re-read it from DRAM. Below
-// this the re-read hits L3 and the interleave is pure overhead. 16 MB cleanly
-// separates the bandwidth-bound winners (>=16 MB: large screenshots, big pngimg)
-// from the moderate images (all measured <=8.5 MB) where streaming costs ~0.3%.
+// Streaming wins beyond LLC capacity; below 16 MB the L3 reread is cheaper and interleaving costs about 0.3%.
 #define STREAM_MIN (16u << 20)
 
 struct sink {
@@ -87,57 +56,44 @@ struct sink {
 	uint32_t bd;
 	uint32_t out_ch;
 	uint32_t eff_trns;
-	int ct;
+	int32_t ct;
 };
 
 // [=]===^=[ globals ]=========================================================[=]
 
-// RFC 1951 length and distance bases / extra bits.
-static const uint16_t length_base[29] = {
+static uint16_t length_base[29] = {
 	3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258
 };
 
-static const uint8_t length_extra[29] = {
+static uint8_t length_extra[29] = {
 	0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0
 };
 
-static const uint16_t dist_base[30] = {
+static uint16_t dist_base[30] = {
 	1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025, 1537, 2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577
 };
 
-static const uint8_t dist_extra[30] = {
+static uint8_t dist_extra[30] = {
 	0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13
 };
 
-static const uint8_t clcidx[19] = {
+static uint8_t clcidx[19] = {
 	16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15
 };
 
-// Adam7 per-pass starting offset and pixel stride.
-static const uint8_t a7_xorig[7] = { 0, 4, 0, 2, 0, 1, 0 };
-static const uint8_t a7_yorig[7] = { 0, 0, 4, 0, 2, 0, 1 };
-static const uint8_t a7_xstep[7] = { 8, 8, 4, 4, 2, 2, 1 };
-static const uint8_t a7_ystep[7] = { 8, 8, 8, 4, 4, 2, 2 };
+static uint8_t a7_xorig[7] = { 0, 4, 0, 2, 0, 1, 0 };
+static uint8_t a7_yorig[7] = { 0, 0, 4, 0, 2, 0, 1 };
+static uint8_t a7_xstep[7] = { 8, 8, 4, 4, 2, 2, 1 };
+static uint8_t a7_ystep[7] = { 8, 8, 8, 4, 4, 2, 2 };
 
 static uint32_t crc_table[256];
-static int crc_ready;
+static uint32_t crc_ready;
 
-// Reused inflate scratch (the full filtered image). Persisting it across decodes
-// avoids re-faulting fresh zeroed pages on every call; image-png streams rows and
-// has no equivalent buffer, so this only removes our own per-call overhead. Only
-// worthwhile above a size threshold: small buffers are cheap to allocate and a
-// fixed reused address tends to 4K-alias the per-call output buffer.
+// Reuse avoids page faults above this threshold; smaller fixed-address buffers regress through 4K aliasing.
 #define RAW_REUSE_MIN (256 * 1024)
-// Raw size at/above which inflate builds the 12-bit comb cascade (mode 1/2).
-// Tuned: lowering it (tested 32768) regresses the high-weight match-heavy palette
-// textures (textures_pk 1.184 -> 1.158): they barely use literals, so the comb's
-// 2-literal fusion gives nothing and the build is dead cost, while only barely
-// helping small literal-heavy RGBA icons. Size can't separate the two; keep 128KB.
+// 32 KB regressed textures_pk from 1.184 to 1.158 because match-heavy palette data cannot amortize comb construction.
 #define BIG_MIN 131072
-// Tail slack on every raw buffer so copy_match's match copy can store a full
-// 16-byte vector past the exact end of a match (pos+length <= raw_size always)
-// without bounds-checking each store. The slop bytes land in padding or get
-// overwritten by the next symbol before they are ever consumed as output.
+// Padding makes unconditional vector stores safe; slop is overwritten before it can become output.
 #define COPY_PAD 16
 static uint8_t *raw_scratch;
 static size_t raw_scratch_cap;
@@ -165,7 +121,6 @@ static void crc_build(void) {
 }
 
 // [=]===^=[ crc_bytes ]=======================================================[=]
-// Byte-at-a-time CRC continuation from a running register (small tails only).
 static uint32_t crc_bytes(uint32_t c, uint8_t *buf, size_t len) {
 	while(len--) {
 		c = crc_table[(c ^ *buf++) & 0xff] ^ (c >> 8);
@@ -174,8 +129,6 @@ static uint32_t crc_bytes(uint32_t c, uint8_t *buf, size_t len) {
 }
 
 // [=]===^=[ crc32_calc ]======================================================[=]
-// CRC-32 (poly 0xedb88320). The 16-byte-aligned bulk is folded with PCLMULQDQ
-// (Intel's reflected algorithm); the sub-16-byte tail finishes via the table.
 static uint32_t crc32_calc(uint8_t *buf, size_t len) {
 	if(len < 16) {
 		return crc_bytes(0xffffffffu, buf, len) ^ 0xffffffffu;
@@ -212,8 +165,6 @@ static uint32_t crc32_calc(uint8_t *buf, size_t len) {
 }
 
 // [=]===^=[ refill ]==========================================================[=]
-// Tops the 64-bit buffer up to at least 57 bits when input allows, via a single
-// 8-byte little-endian load in the common case.
 static inline void refill(struct bitreader *b) {
 	if(b->in + 8 <= b->end) {
 		uint64_t chunk;
@@ -222,6 +173,7 @@ static inline void refill(struct bitreader *b) {
 		uint32_t adv = (63 - b->bitcnt) >> 3;
 		b->in += adv;
 		b->bitcnt += adv << 3;
+
 	} else {
 		while(b->bitcnt <= 56 && b->in < b->end) {
 			b->bitbuf |= (uint64_t)*b->in++ << b->bitcnt;
@@ -251,11 +203,10 @@ static inline uint32_t bit_reverse16(uint32_t v, uint32_t bits) {
 }
 
 // [=]===^=[ huff_build ]======================================================[=]
-// `mode` selects the literal comb, distance comb, or packed small distance table.
-static int huff_build(struct huff *h, uint8_t *lengths, uint32_t num, int mode) {
+// mode is 0 for literal, 1 for combined literal, 2 for combined distance, and 3 for packed distance.
+static int32_t huff_build(struct huff *h, uint8_t *lengths, uint32_t num, uint32_t mode) {
 	uint32_t sizes[17] = { 0 };
 	uint32_t next_code[16];
-	// mode==1 never reads h->fast (comb + canonical tail only), so don't clear it.
 	if(mode != 1) {
 		memset(h->fast, 0, sizeof(h->fast));
 	}
@@ -290,14 +241,13 @@ static int huff_build(struct huff *h, uint8_t *lengths, uint32_t num, int mode) 
 			uint32_t c = next_code[s] - h->firstcode[s] + h->firstsymbol[s];
 			h->size[c] = (uint8_t)s;
 			h->value[c] = (uint16_t)i;
-			// mode==1 decodes everything through the comb and (in the cold tail)
-			// huff_decode_full, which uses only the canonical size/value/maxcode
-			// arrays, so the strided 9-bit fast-table scatter is dead work there.
+			// mode 1 never reads fast, so its strided scatter is dead work.
 			if(mode != 1 && s <= FAST_BITS) {
 				uint32_t j = bit_reverse16(next_code[s], s);
 				while(j < (1u << FAST_BITS)) {
 					if(mode == 3) {
 						h->fast[j] = (uint16_t)(s | ((uint32_t)dist_extra[i] << 4) | (i << 8));
+
 					} else {
 						h->fast[j] = (uint16_t)((s << 9) | i);
 					}
@@ -308,15 +258,7 @@ static int huff_build(struct huff *h, uint8_t *lengths, uint32_t num, int mode) 
 		}
 	}
 
-	// Build the 12-bit comb by table-doubling: place each symbol once at its
-	// codeword, fuse the actual short-literal pairs, then copy the whole table to
-	// double it for the next bit. This replaces a strided per-symbol scatter plus
-	// a full 4096-slot fuse scan; the per-block build dominates small, high-
-	// entropy images (it is ~7x cheaper than the scatter here). comb[] decodes
-	// identically to the scatter it replaces: a fused/single entry written at its
-	// [0,2^L) representative is replicated across all 2^(12-L) extensions by the
-	// doublings, exactly as the scatter wrote them. Codes longer than 12 bits are
-	// left as holes (0) for the per-symbol fallback.
+	// Table doubling is about 7x cheaper than strided scatter plus a full fusion scan while producing the same extensions.
 	if(mode == 1) {
 		uint16_t sorted[288];
 		uint16_t codes[288];
@@ -328,9 +270,7 @@ static int huff_build(struct huff *h, uint8_t *lengths, uint32_t num, int mode) 
 		}
 		uint32_t fill[16];
 		memcpy(fill, offset, sizeof(fill));
-		// Literals (symbol < 256) land first within each length group because the
-		// sort visits symbols in index order, so lit_sizes[len] marks where each
-		// group's literal prefix ends and the fuse loop can skip the <256 tests.
+		// Symbol-order sorting places each length group's literals first, letting fusion skip symbol tests.
 		uint32_t lit_sizes[16] = { 0 };
 		for(uint32_t i = 0; i < num; ++i) {
 			uint32_t s = lengths[i];
@@ -351,14 +291,15 @@ static int huff_build(struct huff *h, uint8_t *lengths, uint32_t num, int mode) 
 				uint32_t centry;
 				if(i < 256) {
 					centry = COMB_LIT | (1u << 8) | ((uint32_t)i << 16) | len;
+
 				} else if(i == 256) {
 					centry = COMB_EOB | len;
+
 				} else if(i - 257 < 29) {
 					uint32_t li = i - 257;
-					// li in bits 25-29 (free; the hot loop reads only base at 16-24,
-					// extra at 8-10, code length in the low byte) lets the cold tail
-					// recover the length symbol without a canonical lookup.
+					// Bits 25..29 preserve the length symbol for the cold tail without a canonical lookup.
 					centry = ((uint32_t)length_extra[li] << 8) | ((uint32_t)length_base[li] << 16) | (li << 25) | len;
+
 				} else {
 					centry = 0;
 				}
@@ -366,9 +307,7 @@ static int huff_build(struct huff *h, uint8_t *lengths, uint32_t num, int mode) 
 				codes[i] = (uint16_t)idx;
 				++cw;
 			}
-			// A length-len1 literal followed by a length-len2 literal (len1+len2
-			// == len) emits two literals from one comb load. Iterate the actual
-			// literal pairs of these lengths instead of scanning every slot.
+			// Enumerating actual literal pairs avoids scanning every comb slot.
 			for(uint32_t len1 = 1; len1 < len; ++len1) {
 				uint32_t len2 = len - len1;
 				uint32_t end1 = offset[len1] + lit_sizes[len1];
@@ -378,9 +317,7 @@ static int huff_build(struct huff *h, uint8_t *lengths, uint32_t num, int mode) 
 					for(uint32_t b = offset[len2]; b < end2; ++b) {
 						uint32_t sym2 = sorted[b];
 						uint32_t idx = codes[sym1] | ((uint32_t)codes[sym2] << len1);
-						// len1 in bits 10-13 (free; the hot loop ignores them) lets
-						// the cold tail recover the first literal's code length
-						// without a canonical search. cb (low byte) = len = len1+len2.
+						// Bits 10..13 preserve the first literal length for the cold tail.
 						h->comb[idx] = COMB_LIT | (2u << 8) | ((uint32_t)len1 << 10) | ((uint32_t)sym1 << 16) | ((uint32_t)sym2 << 24) | len;
 					}
 				}
@@ -389,14 +326,15 @@ static int huff_build(struct huff *h, uint8_t *lengths, uint32_t num, int mode) 
 				memcpy(h->comb + (1u << len), h->comb, (1u << len) * sizeof(h->comb[0]));
 			}
 		}
+
 	} else if(mode == 2) {
-		// Combined distance table: one 9-bit load yields base, extra bits, and
-		// code bits. Codes longer than 9 bits leave the entry 0 (canonical path).
+		// Zero distance entries select the canonical path for codes longer than nine bits.
 		for(uint32_t i = 0; i < (1u << FAST_BITS); ++i) {
 			uint32_t f = h->fast[i];
 			uint32_t sym = f & 511, len = f >> 9;
 			if(f && sym < 30) {
 				h->dist_comb[i] = len | ((uint32_t)dist_extra[sym] << 4) | ((uint32_t)dist_base[sym] << 8);
+
 			} else {
 				h->dist_comb[i] = 0;
 			}
@@ -406,7 +344,7 @@ static int huff_build(struct huff *h, uint8_t *lengths, uint32_t num, int mode) 
 }
 
 // [=]===^=[ huff_decode ]=====================================================[=]
-static inline int huff_decode(struct bitreader *b, struct huff *h) {
+static inline int32_t huff_decode(struct bitreader *b, struct huff *h) {
 	if(b->bitcnt < 16) {
 		refill(b);
 	}
@@ -415,7 +353,7 @@ static inline int huff_decode(struct bitreader *b, struct huff *h) {
 		uint32_t s = f >> 9;
 		b->bitbuf >>= s;
 		b->bitcnt -= s;
-		return (int)(f & 511);
+		return (int32_t)(f & 511);
 	}
 	uint32_t key = bit_reverse16((uint32_t)(b->bitbuf & 0xffff), 16);
 	uint32_t s = FAST_BITS + 1;
@@ -435,22 +373,18 @@ static inline int huff_decode(struct bitreader *b, struct huff *h) {
 }
 
 // [=]===^=[ huff_decode_full ]================================================[=]
-// Cold tail/long-code decoder for the big (mode==1) literal table, which builds
-// only the comb (h->fast is zeroed). Literals and EOB come straight from the
-// comb entry; the code length for the canonical symbol lookup also comes from
-// the comb, so the only search is the rare >12-bit (op==0) case, started at 13.
-static inline int huff_decode_full(struct bitreader *b, struct huff *h) {
+// mode 1 leaves fast unbuilt, so only codes longer than 12 bits require canonical search.
+static inline int32_t huff_decode_full(struct bitreader *b, struct huff *h) {
 	if(b->bitcnt < 16) {
 		refill(b);
 	}
 	uint32_t e = h->comb[b->bitbuf & ((1u << FAST12_BITS) - 1)];
 	if(e & COMB_LIT) {
-		// A fused pair returns its first literal and consumes only len1, leaving
-		// the second for the next call; a single consumes the whole code length.
+		// A fused pair consumes only its first code so the second remains for the next call.
 		uint32_t s = ((e >> 8) & 3) == 2 ? ((e >> 10) & 0xf) : (uint8_t)e;
 		b->bitbuf >>= s;
 		b->bitcnt -= s;
-		return (int)((e >> 16) & 0xff);
+		return (int32_t)((e >> 16) & 0xff);
 	}
 	if(e & COMB_EOB) {
 		b->bitbuf >>= (uint8_t)e;
@@ -460,9 +394,8 @@ static inline int huff_decode_full(struct bitreader *b, struct huff *h) {
 	if(e) {
 		b->bitbuf >>= (uint8_t)e;
 		b->bitcnt -= (uint8_t)e;
-		return (int)(257 + ((e >> 25) & 0x1f));
+		return (int32_t)(257 + ((e >> 25) & 0x1f));
 	}
-	// entry == 0: code longer than 12 bits; canonical search from 13.
 	uint32_t key = bit_reverse16((uint32_t)(b->bitbuf & 0xffff), 16);
 	uint32_t s = 13;
 	while((int32_t)key >= h->maxcode[s]) {
@@ -480,22 +413,14 @@ static inline int huff_decode_full(struct bitreader *b, struct huff *h) {
 	return h->value[idx];
 }
 
-// [=]===^=[ inflate_block ]===================================================[=]
-// No-refill variants for the fast path, which guarantees enough buffered bits.
-static inline uint32_t getbits_nf(struct bitreader *b, uint32_t n) {
-	uint32_t v = (uint32_t)(b->bitbuf & (((uint64_t)1 << n) - 1));
-	b->bitbuf >>= n;
-	b->bitcnt -= n;
-	return v;
-}
-
-static inline int huff_decode_nf(struct bitreader *b, struct huff *h) {
+// [=]===^=[ huff_decode_nf ]==================================================[=]
+static inline int32_t huff_decode_nf(struct bitreader *b, struct huff *h) {
 	uint32_t f = h->fast[b->bitbuf & ((1u << FAST_BITS) - 1)];
 	if(f) {
 		uint32_t s = f >> 9;
 		b->bitbuf >>= s;
 		b->bitcnt -= s;
-		return (int)(f & 511);
+		return (int32_t)(f & 511);
 	}
 	uint32_t key = bit_reverse16((uint32_t)(b->bitbuf & 0xffff), 16);
 	uint32_t s = FAST_BITS + 1;
@@ -520,37 +445,25 @@ static inline void copy_match(uint8_t *out, size_t pos, size_t distance, size_t 
 	uint8_t *dst = out + pos;
 	uint8_t *end = dst + length;
 	if(distance >= 16) {
-		// The common case (short non-overlapping match, or any match whose
-		// distance is >= the 16-byte vector width): copy in unconditional
-		// 16-byte stores with no length branch and no memcpy call. The first
-		// store always writes 16 bytes even when length < 16; the COPY_PAD tail
-		// slack on `out` keeps it in bounds, and the slop is overwritten before
-		// it is read as output. distance >= 16 guarantees each 16-byte source
-		// window sits at or behind the write frontier, so overlap is safe.
+		// COPY_PAD permits unconditional stores, and distance at least 16 keeps every source vector behind the write frontier.
 		_mm_storeu_si128((__m128i *)dst, _mm_loadu_si128((__m128i *)src));
 		for(size_t i = 16; i < length; i += 16) {
 			_mm_storeu_si128((__m128i *)(dst + i), _mm_loadu_si128((__m128i *)(src + i)));
 		}
+
 	} else if(distance >= 8) {
-		// distance 8..15: each 8-byte source window sits fully behind the write
-		// frontier (distance >= 8), so unconditional 8-byte word stores advancing
-		// by 8 are non-overlapping and need no doubling (cf. libdeflate's
-		// offset >= WORDBYTES path). Over-write past `end` lands in COPY_PAD.
+		// Distance at least eight keeps each word source behind the write frontier; overrun lands in COPY_PAD.
 		do {
 			memcpy(dst, src, 8);
 			src += 8;
 			dst += 8;
 		} while(dst < end);
+
 	} else if(distance == 1) {
 		memset(dst, src[0], length);
+
 	} else {
-		// distance 2..7 (RGB/RGBA pixel-stride repeats are the hot case): inline
-		// branchless overlapping 8-byte stores advancing by `distance`. Each
-		// store writes 8 bytes but commits only `distance` forward; later
-		// overlapping stores propagate the period and correct the slop, so the
-		// final bytes are exact (cf. libdeflate's offset-stride path). Reads of
-		// not-yet-final bytes stay within `out`+COPY_PAD and are overwritten
-		// before they are read as output.
+		// Overlapping word stores propagate periods of two through seven bytes; COPY_PAD contains temporary slop.
 		do {
 			memcpy(dst, src, 8);
 			src += distance;
@@ -560,14 +473,13 @@ static inline void copy_match(uint8_t *out, size_t pos, size_t distance, size_t 
 }
 
 // [=]===^=[ do_match ]========================================================[=]
-// Handles a length/distance pair (sym is the raw 257..285 length symbol).
-static inline int do_match(struct bitreader *b, uint32_t sym, struct huff *dist, uint8_t *out, size_t *pos, size_t outsize) {
+static inline int32_t do_match(struct bitreader *b, uint32_t sym, struct huff *dist, uint8_t *out, size_t *pos, size_t outsize) {
 	uint32_t li = sym - 257;
 	if(li >= 29) {
 		return -1;
 	}
 	size_t length = length_base[li] + getbits(b, length_extra[li]);
-	int dsym = huff_decode(b, dist);
+	int32_t dsym = huff_decode(b, dist);
 	if(dsym < 0 || dsym >= 30) {
 		return -1;
 	}
@@ -582,7 +494,7 @@ static inline int do_match(struct bitreader *b, uint32_t sym, struct huff *dist,
 
 // [=]===^=[ do_match_small ]==================================================[=]
 __attribute__((always_inline))
-static inline int do_match_small(struct bitreader *b, uint32_t sym, struct huff *dist, uint8_t *out, size_t *pos, size_t outsize) {
+static inline int32_t do_match_small(struct bitreader *b, uint32_t sym, struct huff *dist, uint8_t *out, size_t *pos, size_t outsize) {
 	uint32_t li = sym - 257;
 	if(li >= 29) {
 		return -1;
@@ -601,6 +513,7 @@ static inline int do_match_small(struct bitreader *b, uint32_t sym, struct huff 
 		b->bitbuf >>= dcb;
 		b->bitcnt -= dcb;
 		distance = base + getbits(b, dex);
+
 	} else {
 		uint32_t key = bit_reverse16((uint32_t)(b->bitbuf & 0xffff), 16);
 		uint32_t s = FAST_BITS + 1;
@@ -631,11 +544,11 @@ static inline int do_match_small(struct bitreader *b, uint32_t sym, struct huff 
 }
 
 // [=]===^=[ paeth ]===========================================================[=]
-static uint8_t paeth(int a, int b, int c) {
-	int p = a + b - c;
-	int pa = p > a ? p - a : a - p;
-	int pb = p > b ? p - b : b - p;
-	int pc = p > c ? p - c : c - p;
+static uint8_t paeth(int32_t a, int32_t b, int32_t c) {
+	int32_t p = a + b - c;
+	int32_t pa = p > a ? p - a : a - p;
+	int32_t pb = p > b ? p - b : b - p;
+	int32_t pc = p > c ? p - c : c - p;
 	if(pa <= pb && pa <= pc) {
 		return (uint8_t)a;
 	}
@@ -646,7 +559,6 @@ static uint8_t paeth(int a, int b, int c) {
 }
 
 // [=]===^=[ load4_u16 ]=======================================================[=]
-// Loads 4 bytes and zero-extends to four 16-bit lanes (alias-safe).
 static inline __m128i load4_u16(uint8_t *p) {
 	int t;
 	memcpy(&t, p, 4);
@@ -654,7 +566,6 @@ static inline __m128i load4_u16(uint8_t *p) {
 }
 
 // [=]===^=[ store4 ]==========================================================[=]
-// Packs four 16-bit lanes (values 0..255) and writes 4 bytes.
 static inline void store4(uint8_t *p, __m128i res) {
 	int t = _mm_cvtsi128_si32(_mm_packus_epi16(res, res));
 	memcpy(p, &t, 4);
@@ -662,8 +573,7 @@ static inline void store4(uint8_t *p, __m128i res) {
 
 // [=]===^=[ store3 ]==========================================================[=]
 static inline void store3(uint8_t *p, __m128i res) {
-	// One word store + one byte store, not three byte stores: a 4-byte store
-	// would clobber the next pixel's not-yet-read raw input byte at p[3].
+	// A four-byte store would clobber the next pixel's unread input byte.
 	res = _mm_packus_epi16(res, res);
 	uint16_t lo = (uint16_t)_mm_extract_epi16(res, 0);
 	memcpy(p, &lo, 2);
@@ -671,7 +581,6 @@ static inline void store3(uint8_t *p, __m128i res) {
 }
 
 // [=]===^=[ unfilter_up ]=====================================================[=]
-// Up filter: vertical add, no horizontal dependency.
 static void unfilter_up(uint8_t *cur, uint8_t *prev, size_t n) {
 	size_t i = 0;
 	for(; i + 32 <= n; i += 32) {
@@ -685,15 +594,12 @@ static void unfilter_up(uint8_t *cur, uint8_t *prev, size_t n) {
 }
 
 // [=]===^=[ paeth_predict_simd ]==============================================[=]
-// Paeth predictor across the lanes of one pixel, matching the scalar tie-break
-// (prefer a, then b, then c). Inputs are 16-bit lanes holding 0..255. The u16
-// abs formulation keeps the loop-carried chain short; an 8-bit saturating-
-// subtract version was tried and REGRESSED (longer chain, paeth is latency-bound).
+// The u16 absolute-value form shortens the latency-bound chain; an 8-bit saturating-subtract form regressed.
 static inline __m128i paeth_predict_simd(__m128i a, __m128i b, __m128i c) {
 	__m128i pa = _mm_abs_epi16(_mm_sub_epi16(b, c));
 	__m128i pb = _mm_abs_epi16(_mm_sub_epi16(a, c));
 	__m128i pc = _mm_abs_epi16(_mm_sub_epi16(_mm_add_epi16(a, b), _mm_add_epi16(c, c)));
-	__m128i not_b = _mm_cmpgt_epi16(pb, pc);			// !(pb <= pc)
+	__m128i not_b = _mm_cmpgt_epi16(pb, pc);
 	__m128i pred = _mm_blendv_epi8(b, c, not_b);
 	__m128i not_a = _mm_or_si128(_mm_cmpgt_epi16(pa, pb), _mm_cmpgt_epi16(pa, pc));
 	return _mm_blendv_epi8(a, pred, not_a);
@@ -702,8 +608,8 @@ static inline __m128i paeth_predict_simd(__m128i a, __m128i b, __m128i c) {
 // [=]===^=[ paeth_simd_bpp4 ]=================================================[=]
 static void paeth_simd_bpp4(uint8_t *cur, uint8_t *prev, size_t n) {
 	__m128i mask = _mm_set1_epi16(0xff);
-	__m128i a = _mm_setzero_si128();	// reconstructed left pixel
-	__m128i c = _mm_setzero_si128();	// reconstructed upper-left pixel
+	__m128i a = _mm_setzero_si128();
+	__m128i c = _mm_setzero_si128();
 	for(size_t i = 0; i < n; i += 4) {
 		__m128i b = load4_u16(prev + i);
 		__m128i pred = paeth_predict_simd(a, b, c);
@@ -731,7 +637,6 @@ static void paeth_simd_bpp3(uint8_t *cur, uint8_t *prev, size_t n) {
 		a = res;
 		c = b;
 	}
-	// Final pixel(s): scalar, reading the already-reconstructed neighbours.
 	for(; i < n; ++i) {
 		cur[i] = (uint8_t)(cur[i] + paeth(cur[i - 3], prev[i], prev[i - 3]));
 	}
@@ -739,7 +644,6 @@ static void paeth_simd_bpp3(uint8_t *cur, uint8_t *prev, size_t n) {
 
 // [=]===^=[ sub_simd_bpp4 ]===================================================[=]
 static void sub_simd_bpp4(uint8_t *cur, size_t n) {
-	// res = (cur + left) mod 256 is a plain 8-bit add per pixel; no u16 widen.
 	__m128i a = _mm_setzero_si128();
 	for(size_t i = 0; i < n; i += 4) {
 		int ct;
@@ -771,9 +675,7 @@ static void sub_simd_bpp3(uint8_t *cur, size_t n) {
 
 // [=]===^=[ avg_simd_bpp4 ]===================================================[=]
 static void avg_simd_bpp4(uint8_t *cur, uint8_t *prev, size_t n) {
-	// 8-bit lanes throughout: floor((a+b)/2) == avg_epu8(a,b) - ((a^b)&1), and
-	// the +cur wraps mod 256 in an 8-bit add, so no u16 widen/pack per pixel.
-	// One pixel per iteration (the left term `a` is loop-carried).
+	// Correcting avg_epu8 by the low xor bit avoids a u16 widen and pack on the loop-carried chain.
 	__m128i one = _mm_set1_epi8(1);
 	__m128i a = _mm_setzero_si128();
 	for(size_t i = 0; i < n; i += 4) {
@@ -815,64 +717,63 @@ static void avg_simd_bpp3(uint8_t *cur, uint8_t *prev, size_t n) {
 }
 
 // [=]===^=[ unfilter_row ]====================================================[=]
-// Reverses one PNG row filter in place. `prev` is the previous reconstructed row
-// (NULL for the first row of an image/pass). `bpp` is bytes-per-pixel rounded up.
-static int unfilter_row(uint8_t *cur, uint8_t *prev, uint8_t f, size_t row_bytes, uint32_t bpp) {
+static int32_t unfilter_row(uint8_t *cur, uint8_t *prev, uint8_t f, size_t row_bytes, uint32_t bpp) {
 	switch(f) {
 		case 0: {
-			break;
-		}
+		} break;
 
 		case 1: {
 			if(bpp == 4) {
 				sub_simd_bpp4(cur, row_bytes);
+
 			} else if(bpp == 3) {
 				sub_simd_bpp3(cur, row_bytes);
+
 			} else {
 				for(size_t i = bpp; i < row_bytes; ++i) {
 					cur[i] = (uint8_t)(cur[i] + cur[i - bpp]);
 				}
 			}
-			break;
-		}
+		} break;
 
 		case 2: {
 			if(prev) {
 				unfilter_up(cur, prev, row_bytes);
 			}
-			break;
-		}
+		} break;
 
 		case 3: {
 			if(prev && bpp == 4) {
 				avg_simd_bpp4(cur, prev, row_bytes);
+
 			} else if(prev && bpp == 3) {
 				avg_simd_bpp3(cur, prev, row_bytes);
+
 			} else {
 				for(size_t i = 0; i < row_bytes; ++i) {
-					int a = i >= bpp ? cur[i - bpp] : 0;
-					int b = prev ? prev[i] : 0;
+					int32_t a = i >= bpp ? cur[i - bpp] : 0;
+					int32_t b = prev ? prev[i] : 0;
 					cur[i] = (uint8_t)(cur[i] + ((a + b) >> 1));
 				}
 			}
-			break;
-		}
+		} break;
 
 		case 4: {
 			if(prev && bpp == 4) {
 				paeth_simd_bpp4(cur, prev, row_bytes);
+
 			} else if(prev && bpp == 3) {
 				paeth_simd_bpp3(cur, prev, row_bytes);
+
 			} else {
 				for(size_t i = 0; i < row_bytes; ++i) {
-					int a = i >= bpp ? cur[i - bpp] : 0;
-					int b = prev ? prev[i] : 0;
-					int c = (prev && i >= bpp) ? prev[i - bpp] : 0;
+					int32_t a = i >= bpp ? cur[i - bpp] : 0;
+					int32_t b = prev ? prev[i] : 0;
+					int32_t c = (prev && i >= bpp) ? prev[i - bpp] : 0;
 					cur[i] = (uint8_t)(cur[i] + paeth(a, b, c));
 				}
 			}
-			break;
-		}
+		} break;
 
 		default: {
 			return -1;
@@ -882,9 +783,7 @@ static int unfilter_row(uint8_t *cur, uint8_t *prev, uint8_t f, size_t row_bytes
 }
 
 // [=]===^=[ unfilter ]========================================================[=]
-// Reverses PNG row filters in place. `raw` holds `rows` lines, each one filter
-// byte followed by `row_bytes` data bytes. `bpp` is bytes-per-pixel rounded up.
-static int unfilter(uint8_t *raw, uint32_t rows, size_t row_bytes, uint32_t bpp) {
+static int32_t unfilter(uint8_t *raw, uint32_t rows, size_t row_bytes, uint32_t bpp) {
 	size_t stride = row_bytes + 1;
 	uint8_t *prev = 0;
 	for(uint32_t y = 0; y < rows; ++y) {
@@ -898,8 +797,6 @@ static int unfilter(uint8_t *raw, uint32_t rows, size_t row_bytes, uint32_t bpp)
 }
 
 // [=]===^=[ sample_bits ]=====================================================[=]
-// Extracts the sample at index `i` from an MSB-first packed row of `bd`-bit
-// samples (bd is 1, 2 or 4).
 static uint32_t sample_bits(uint8_t *row, uint32_t i, uint32_t bd) {
 	uint32_t per_byte = 8 / bd;
 	uint32_t byte = row[i / per_byte];
@@ -908,16 +805,13 @@ static uint32_t sample_bits(uint8_t *row, uint32_t i, uint32_t bd) {
 }
 
 // [=]===^=[ expand_row ]======================================================[=]
-// Converts one unfiltered row of samples to the EXPAND|STRIP_16 output row.
-static void expand_row(uint8_t *src, uint8_t *dst, uint32_t width, uint32_t bd, int ct, uint8_t *plte, uint8_t *trns, uint32_t trns_len, uint32_t out_ch, uint32_t *pal32) {
-	// 8-bit passthrough: when no palette/tRNS/16-bit expansion changes the layout
-	// the row is a straight copy. Covers rgba8, rgb8 (no tRNS), gray+a8, gray8.
+static void expand_row(uint8_t *src, uint8_t *dst, uint32_t width, uint32_t bd, int32_t ct, uint8_t *plte, uint8_t *trns, uint32_t trns_len, uint32_t out_ch, uint32_t *pal32) {
 	if(bd == 8 && (ct == 6 || ct == 4 || (ct == 2 && out_ch == 3) || (ct == 0 && out_ch == 1))) {
 		memcpy(dst, src, (size_t)width * out_ch);
 		return;
 	}
 	switch(ct) {
-		case 0: {	// grayscale
+		case 0: {
 			uint32_t maxval = (1u << bd) - 1;
 			uint32_t tgray = (trns_len >= 2) ? ((uint32_t)trns[0] << 8 | trns[1]) : 0xffffffffu;
 			for(uint32_t x = 0; x < width; ++x) {
@@ -925,9 +819,11 @@ static void expand_row(uint8_t *src, uint8_t *dst, uint32_t width, uint32_t bd, 
 				if(bd == 16) {
 					raw16 = (uint32_t)src[x * 2] << 8 | src[x * 2 + 1];
 					v8 = src[x * 2];
+
 				} else if(bd == 8) {
 					raw16 = src[x];
 					v8 = src[x];
+
 				} else {
 					uint32_t s = sample_bits(src, x, bd);
 					raw16 = s;
@@ -939,10 +835,9 @@ static void expand_row(uint8_t *src, uint8_t *dst, uint32_t width, uint32_t bd, 
 				}
 				dst += out_ch;
 			}
-			break;
-		}
+		} break;
 
-		case 2: {	// rgb
+		case 2: {
 			uint32_t tr = 0xffffffffu, tg = 0, tb = 0;
 			if(trns_len >= 6) {
 				tr = (uint32_t)trns[0] << 8 | trns[1];
@@ -958,6 +853,7 @@ static void expand_row(uint8_t *src, uint8_t *dst, uint32_t width, uint32_t bd, 
 					dst[0] = src[x * 6 + 0];
 					dst[1] = src[x * 6 + 2];
 					dst[2] = src[x * 6 + 4];
+
 				} else {
 					r16 = src[x * 3 + 0];
 					g16 = src[x * 3 + 1];
@@ -971,19 +867,16 @@ static void expand_row(uint8_t *src, uint8_t *dst, uint32_t width, uint32_t bd, 
 				}
 				dst += out_ch;
 			}
-			break;
-		}
+		} break;
 
-		case 3: {	// palette
+		case 3: {
 			if(bd == 8 && pal32 && out_ch == 4) {
 				for(uint32_t x = 0; x < width; ++x) {
 					memcpy(dst + (size_t)x * 4, &pal32[src[x]], 4);
 				}
+
 			} else if(bd == 8 && pal32) {
-				// Palette -> RGB: store the whole 4-byte LUT entry per pixel (one
-				// store, not three) and advance 3; each store's 4th byte is the
-				// next pixel's R, overwritten on the next iteration. The last pixel
-				// is written exactly so nothing spills past the row.
+				// Overlapping four-byte stores reduce store count; the final pixel is exact to prevent row overrun.
 				uint32_t x = 0;
 				for(; x + 1 < width; ++x) {
 					memcpy(dst, &pal32[src[x]], 4);
@@ -995,6 +888,7 @@ static void expand_row(uint8_t *src, uint8_t *dst, uint32_t width, uint32_t bd, 
 					dst[1] = (uint8_t)(p >> 8);
 					dst[2] = (uint8_t)(p >> 16);
 				}
+
 			} else {
 				for(uint32_t x = 0; x < width; ++x) {
 					uint32_t idx = (bd == 8) ? src[x] : sample_bits(src, x, bd);
@@ -1007,30 +901,30 @@ static void expand_row(uint8_t *src, uint8_t *dst, uint32_t width, uint32_t bd, 
 					dst += out_ch;
 				}
 			}
-			break;
-		}
+		} break;
 
-		case 4: {	// gray + alpha
+		case 4: {
 			for(uint32_t x = 0; x < width; ++x) {
 				if(bd == 16) {
 					dst[0] = src[x * 4 + 0];
 					dst[1] = src[x * 4 + 2];
+
 				} else {
 					dst[0] = src[x * 2 + 0];
 					dst[1] = src[x * 2 + 1];
 				}
 				dst += out_ch;
 			}
-			break;
-		}
+		} break;
 
-		case 6: {	// rgba
+		case 6: {
 			for(uint32_t x = 0; x < width; ++x) {
 				if(bd == 16) {
 					dst[0] = src[x * 8 + 0];
 					dst[1] = src[x * 8 + 2];
 					dst[2] = src[x * 8 + 4];
 					dst[3] = src[x * 8 + 6];
+
 				} else {
 					dst[0] = src[x * 4 + 0];
 					dst[1] = src[x * 4 + 1];
@@ -1039,17 +933,13 @@ static void expand_row(uint8_t *src, uint8_t *dst, uint32_t width, uint32_t bd, 
 				}
 				dst += out_ch;
 			}
-			break;
-		}
+		} break;
 	}
 }
 
 // [=]===^=[ sink_consume ]====================================================[=]
-// Unfilters and expands every row whose bytes are now at least `window` behind
-// the inflate write frontier `pos` (so they can no longer be back-referenced and
-// are safe to mutate in place). The final flush passes window == 0 to drain the
-// rest once inflate has finished and no back-reference can remain.
-static int sink_consume(struct sink *s, size_t pos, size_t window) {
+// Only rows beyond window can be mutated before inflate completes; a zero window performs the final drain.
+static int32_t sink_consume(struct sink *s, size_t pos, size_t window) {
 	while(s->crow < s->height && (size_t)(s->crow + 1) * s->stride + window <= pos) {
 		uint8_t *cur = s->raw + (size_t)s->crow * s->stride + 1;
 		if(unfilter_row(cur, s->prev, s->raw[(size_t)s->crow * s->stride], s->row_bytes, s->bpp) != 0) {
@@ -1063,30 +953,15 @@ static int sink_consume(struct sink *s, size_t pos, size_t window) {
 }
 
 // [=]===^=[ inflate_block ]===================================================[=]
-// Decodes one block. Large images (`big != 0`) use a 12-bit table that resolves codes
-// up to 12 bits and emits up to two literals per iteration; small images use the
-// cheap 9-bit table and a three-literal-per-refill loop. Both fall back to a
-// per-symbol path for long codes and near the buffer ends. When `sink` is set
-// (non-interlaced large images) the big path streams completed rows through the
-// fused unfilter/expand consumer at chunk boundaries, keeping `raw` cache-hot.
-// Mode 2 delays the fourth lookup until the first three entries prove literal.
-static int inflate_block(struct bitreader *restrict b, struct huff *lit, struct huff *dist, uint8_t *restrict out, size_t outsize, size_t *outpos, int big, struct sink *sink) {
+// big selects the 12-bit cascade, and mode 2 delays its fourth lookup until three entries prove literal.
+static int32_t inflate_block(struct bitreader *restrict b, struct huff *lit, struct huff *dist, uint8_t *restrict out, size_t outsize, size_t *outpos, uint32_t big, struct sink *sink) {
 	size_t pos = *outpos;
 	for(;;) {
 		if(big) {
-			// fdeflate-style cascade: when the current symbol is a literal, issue
-			// the next three table loads from the UNCONSUMED bit buffer (offset by
-			// the cumulative code bits) so their L1 latencies pipeline instead of
-			// serializing through a buffer shift each literal. Up to three literals
-			// emit per group, then one consume + refill. `e1` carries the next
-			// preloaded entry across iterations.
+			// Indexing the unconsumed buffer pipelines three dependent literal-table loads across L1 latency.
 			refill(b);
 			uint32_t e1 = lit->comb[b->bitbuf & ((1u << FAST12_BITS) - 1)];
-			// Chunk loop: bound the fast inner loop to STREAM_CHUNK bytes of output
-			// at a time when streaming, then drain rows that have fallen a full
-			// window behind. The inner guard is `pos + 8 <= chunk_end` (== outsize
-			// when not streaming), so the hot path is byte-for-byte unchanged; only
-			// how often it exits to the consumer differs.
+			// Chunk boundaries amortize consumer table eviction while keeping consumed rows beyond the back-reference window.
 			for(;;) {
 				size_t chunk_end = outsize;
 				if(sink) {
@@ -1096,10 +971,8 @@ static int inflate_block(struct bitreader *restrict b, struct huff *lit, struct 
 					}
 				}
 				while(b->in + 8 <= b->end && pos + 8 <= chunk_end) {
-					if(e1 & COMB_LIT) {	// literal: low-byte code length feeds the cascade directly
-						// Code length is the low byte, usable as a shift count with no extraction,
-						// so each speculative look-ahead index is one shrx (cf. fdeflate). Issue the
-						// next three loads from the unconsumed buffer at cumulative code-bit offsets.
+					if(e1 & COMB_LIT) {
+						// Low-byte code lengths feed shrx directly without an extraction dependency.
 						uint32_t e2 = lit->comb[(b->bitbuf >> (uint8_t)e1) & ((1u << FAST12_BITS) - 1)];
 						uint32_t e3 = lit->comb[(b->bitbuf >> ((uint8_t)e1 + (uint8_t)e2)) & ((1u << FAST12_BITS) - 1)];
 						uint32_t e4 = 0;
@@ -1129,6 +1002,7 @@ static int inflate_block(struct bitreader *restrict b, struct huff *lit, struct 
 							b->bitbuf >>= (uint8_t)e1 + (uint8_t)e2;
 							b->bitcnt -= (uint8_t)e1 + (uint8_t)e2;
 							e1 = e3;
+
 						} else {
 							b->bitbuf >>= (uint8_t)e1;
 							b->bitcnt -= (uint8_t)e1;
@@ -1136,17 +1010,15 @@ static int inflate_block(struct bitreader *restrict b, struct huff *lit, struct 
 						}
 						refill(b);
 					}
-					// e1 is now a match, end-of-block, or long code (entry == 0).
 					if(e1 == 0) {
-						break;	// code longer than 12 bits, use the per-symbol path.
+						break;
 					}
 					b->bitbuf >>= (uint8_t)e1;
 					b->bitcnt -= (uint8_t)e1;
-					if(e1 & COMB_EOB) {	// end of block
+					if(e1 & COMB_EOB) {
 						*outpos = pos;
 						return 0;
 					}
-					// match
 					size_t length = ((e1 >> 16) & 0x1ff) + getbits(b, (e1 >> 8) & 7);
 					uint32_t de = dist->dist_comb[b->bitbuf & ((1u << FAST_BITS) - 1)];
 					size_t distance;
@@ -1156,8 +1028,9 @@ static int inflate_block(struct bitreader *restrict b, struct huff *lit, struct 
 						distance = (de >> 8) + ((b->bitbuf >> dcb) & (((uint32_t)1 << dex) - 1));
 						b->bitbuf >>= dcb + dex;
 						b->bitcnt -= dcb + dex;
+
 					} else {
-						int dsym = huff_decode(b, dist);
+						int32_t dsym = huff_decode(b, dist);
 						if(dsym < 0 || dsym >= 30) {
 							*outpos = pos;
 							return -1;
@@ -1168,19 +1041,14 @@ static int inflate_block(struct bitreader *restrict b, struct huff *lit, struct 
 						*outpos = pos;
 						return -1;
 					}
-					// Refill and preload the next litlen entry BEFORE issuing the
-					// match copy, so the copy's store latency overlaps this
-					// independent next-iteration setup instead of serializing
-					// after it (cf. libdeflate's fastloop). bitbuf is already in
-					// its final post-distance state, so the preloaded entry is
-					// identical to loading it after the copy.
+					// Preloading after distance consumption overlaps next-iteration setup with match-copy store latency.
 					refill(b);
 					e1 = lit->comb[b->bitbuf & ((1u << FAST12_BITS) - 1)];
 					copy_match(out, pos, distance, length);
 					pos += length;
 				}
 				if(b->in + 8 <= b->end && pos + 8 <= chunk_end) {
-					break;	// long code (op == 0): hand to the per-symbol path.
+					break;
 				}
 				if(sink) {
 					if(sink_consume(sink, pos, INFLATE_WINDOW) != 0) {
@@ -1193,9 +1061,10 @@ static int inflate_block(struct bitreader *restrict b, struct huff *lit, struct 
 				}
 				break;
 			}
+
 		} else if(b->in + 8 <= b->end && pos + 3 <= outsize) {
 			refill(b);
-			int sym = huff_decode_nf(b, lit);
+			int32_t sym = huff_decode_nf(b, lit);
 			if(sym < 256) {
 				out[pos++] = (uint8_t)sym;
 				sym = huff_decode_nf(b, lit);
@@ -1223,10 +1092,7 @@ static int inflate_block(struct bitreader *restrict b, struct huff *lit, struct 
 			continue;
 		}
 
-		// Per-symbol path: long codes and the tail near the buffer ends. The big
-		// literal table has no fast table, so it decodes through the full-range
-		// canonical path.
-		int sym = big ? huff_decode_full(b, lit) : huff_decode(b, lit);
+		int32_t sym = big ? huff_decode_full(b, lit) : huff_decode(b, lit);
 		if(sym < 256) {
 			if(sym < 0 || pos >= outsize) {
 				*outpos = pos;
@@ -1247,7 +1113,7 @@ static int inflate_block(struct bitreader *restrict b, struct huff *lit, struct 
 }
 
 // [=]===^=[ inflate_fixed_tables ]============================================[=]
-static void inflate_fixed_tables(struct huff *lit, struct huff *dist, int big) {
+static void inflate_fixed_tables(struct huff *lit, struct huff *dist, uint32_t big) {
 	uint8_t lengths[288];
 	uint32_t i = 0;
 	for(; i < 144; ++i) {
@@ -1272,7 +1138,7 @@ static void inflate_fixed_tables(struct huff *lit, struct huff *dist, int big) {
 }
 
 // [=]===^=[ inflate_dynamic_tables ]==========================================[=]
-static int inflate_dynamic_tables(struct bitreader *b, struct huff *lit, struct huff *dist, int big) {
+static int32_t inflate_dynamic_tables(struct bitreader *b, struct huff *lit, struct huff *dist, uint32_t big) {
 	uint32_t hlit = getbits(b, 5) + 257;
 	uint32_t hdist = getbits(b, 5) + 1;
 	uint32_t hclen = getbits(b, 4) + 4;
@@ -1290,12 +1156,13 @@ static int inflate_dynamic_tables(struct bitreader *b, struct huff *lit, struct 
 	uint32_t n = 0;
 	uint32_t total = hlit + hdist;
 	while(n < total) {
-		int sym = huff_decode(b, &cl);
+		int32_t sym = huff_decode(b, &cl);
 		if(sym < 0) {
 			return -1;
 		}
 		if(sym < 16) {
 			lengths[n++] = (uint8_t)sym;
+
 		} else if(sym == 16) {
 			if(n == 0) {
 				return -1;
@@ -1305,11 +1172,13 @@ static int inflate_dynamic_tables(struct bitreader *b, struct huff *lit, struct 
 			while(rep-- && n < total) {
 				lengths[n++] = prev;
 			}
+
 		} else if(sym == 17) {
 			uint32_t rep = getbits(b, 3) + 3;
 			while(rep-- && n < total) {
 				lengths[n++] = 0;
 			}
+
 		} else {
 			uint32_t rep = getbits(b, 7) + 11;
 			while(rep-- && n < total) {
@@ -1325,14 +1194,10 @@ static int inflate_dynamic_tables(struct bitreader *b, struct huff *lit, struct 
 }
 
 // [=]===^=[ inflate_stream ]====================================================[=]
-// Decompresses a zlib stream into a buffer of exactly `outsize` bytes. Nonzero
-// `big` selects the high-throughput 12-bit tables; mode 2 selects the dense-stream
-// literal schedule.
-static int inflate_stream(uint8_t *in, size_t inlen, uint8_t *out, size_t outsize, int big, struct sink *sink) {
+static int32_t inflate_stream(uint8_t *in, size_t inlen, uint8_t *out, size_t outsize, uint32_t big, struct sink *sink) {
 	if(inlen < 2) {
 		return -1;
 	}
-	// zlib header: CM must be 8, header checksum mod 31, no preset dictionary.
 	if((in[0] & 0x0f) != 8 || ((in[0] << 8 | in[1]) % 31) != 0 || (in[1] & 0x20)) {
 		return -1;
 	}
@@ -1343,16 +1208,13 @@ static int inflate_stream(uint8_t *in, size_t inlen, uint8_t *out, size_t outsiz
 		uint32_t bfinal = getbits(&b, 1);
 		uint32_t btype = getbits(&b, 2);
 		if(btype == 0) {
-			b.bitbuf >>= b.bitcnt & 7;	// align to byte boundary
+			b.bitbuf >>= b.bitcnt & 7;
 			b.bitcnt -= b.bitcnt & 7;
 			uint32_t len = getbits(&b, 16);
 			uint32_t nlen = getbits(&b, 16);
 			if((len ^ 0xffff) != nlen || outpos + len > outsize) {
 				return -1;
 			}
-			// The len data bytes are byte-aligned; refuse up front if the input
-			// (buffered bytes plus unread bytes) cannot hold them, rather than
-			// copying zeros from an exhausted reader.
 			if(len > b.bitcnt / 8 + (size_t)(b.end - b.in)) {
 				return -1;
 			}
@@ -1367,16 +1229,19 @@ static int inflate_stream(uint8_t *in, size_t inlen, uint8_t *out, size_t outsiz
 				b.in += remaining;
 				outpos += remaining;
 			}
+
 		} else if(btype == 1 || btype == 2) {
 			struct huff lit, dist;
 			if(btype == 1) {
 				inflate_fixed_tables(&lit, &dist, big);
+
 			} else if(inflate_dynamic_tables(&b, &lit, &dist, big)) {
 				return -1;
 			}
 			if(inflate_block(&b, &lit, &dist, out, outsize, &outpos, big, sink)) {
 				return -1;
 			}
+
 		} else {
 			return -1;
 		}
@@ -1388,7 +1253,7 @@ static int inflate_stream(uint8_t *in, size_t inlen, uint8_t *out, size_t outsiz
 }
 
 // [=]===^=[ output_channels ]=================================================[=]
-static uint32_t output_channels(int ct, uint32_t trns_len) {
+static uint32_t output_channels(int32_t ct, uint32_t trns_len) {
 	switch(ct) {
 		case 0: {
 			return trns_len ? 2 : 1;
@@ -1414,7 +1279,7 @@ static uint32_t output_channels(int ct, uint32_t trns_len) {
 }
 
 // [=]===^=[ raw_channels ]====================================================[=]
-static uint32_t raw_channels(int ct) {
+static uint32_t raw_channels(int32_t ct) {
 	switch(ct) {
 		case 0: {
 			return 1;
@@ -1441,7 +1306,7 @@ static uint32_t raw_channels(int ct) {
 
 // [=]===^=[ pd_decode ]======================================================[=]
 int pd_decode(uint8_t *data, size_t len, struct pd_image *out) {
-	static const uint8_t sig[8] = { 0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a };
+	static uint8_t sig[8] = { 0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a };
 	if(!crc_ready) {
 		crc_build();
 	}
@@ -1451,18 +1316,18 @@ int pd_decode(uint8_t *data, size_t len, struct pd_image *out) {
 
 	uint32_t width = 0, height = 0;
 	uint32_t bd = 0;
-	int ct = -1;
-	int interlace = 0;
+	int32_t ct = -1;
+	uint32_t interlace = 0;
 	uint8_t plte[256 * 3];
 	uint8_t trns[256];
 	uint32_t trns_len = 0;
-	int have_ihdr = 0;
+	uint32_t have_ihdr = 0;
 
 	uint8_t *idat = 0;
 	size_t idat_len = 0, idat_cap = 0;
 
 	size_t pos = 8;
-	int saw_iend = 0;
+	uint32_t saw_iend = 0;
 	while(pos + 8 <= len) {
 		uint32_t clen = (uint32_t)data[pos] << 24 | (uint32_t)data[pos + 1] << 16 | (uint32_t)data[pos + 2] << 8 | data[pos + 3];
 		uint8_t *type = data + pos + 4;
@@ -1470,8 +1335,7 @@ int pd_decode(uint8_t *data, size_t len, struct pd_image *out) {
 			break;
 		}
 		uint8_t *cdata = data + pos + 8;
-		// Critical chunks (uppercase first letter) must pass CRC. Ancillary CRC
-		// failures are tolerated, matching image-png's skip_ancillary_crc_failures.
+		// Ancillary CRC failures are tolerated to match image-png's skip_ancillary_crc_failures behavior.
 		if(!(type[0] & 0x20)) {
 			uint32_t stored = (uint32_t)data[pos + 8 + clen] << 24 | (uint32_t)data[pos + 9 + clen] << 16 | (uint32_t)data[pos + 10 + clen] << 8 | data[pos + 11 + clen];
 			if(crc32_calc(type, clen + 4) != stored) {
@@ -1491,15 +1355,18 @@ int pd_decode(uint8_t *data, size_t len, struct pd_image *out) {
 			ct = cdata[9];
 			interlace = cdata[12];
 			have_ihdr = 1;
+
 		} else if(memcmp(type, "PLTE", 4) == 0) {
 			if(clen > sizeof(plte)) {
 				free(idat);
 				return 1;
 			}
 			memcpy(plte, cdata, clen);
+
 		} else if(memcmp(type, "tRNS", 4) == 0) {
 			trns_len = clen > sizeof(trns) ? sizeof(trns) : clen;
 			memcpy(trns, cdata, trns_len);
+
 		} else if(memcmp(type, "IDAT", 4) == 0) {
 			if(idat_len + clen > idat_cap) {
 				idat_cap = (idat_len + clen) * 2;
@@ -1512,6 +1379,7 @@ int pd_decode(uint8_t *data, size_t len, struct pd_image *out) {
 			}
 			memcpy(idat + idat_len, cdata, clen);
 			idat_len += clen;
+
 		} else if(memcmp(type, "IEND", 4) == 0) {
 			saw_iend = 1;
 			break;
@@ -1534,7 +1402,6 @@ int pd_decode(uint8_t *data, size_t len, struct pd_image *out) {
 		free(idat);
 		return 1;
 	}
-	// tRNS only adds alpha for gray/rgb/palette; recompute the active length.
 	uint32_t eff_trns = (ct == 0 || ct == 2 || ct == 3) ? trns_len : 0;
 	size_t bits_per_pixel = (size_t)rch * bd;
 	uint32_t bpp = (uint32_t)((bits_per_pixel + 7) / 8);
@@ -1542,8 +1409,6 @@ int pd_decode(uint8_t *data, size_t len, struct pd_image *out) {
 		bpp = 1;
 	}
 
-	// Precompute an RGBA LUT once for 8-bit palette images so expansion is a
-	// single load per pixel instead of three indexed palette reads.
 	uint32_t pal32[256];
 	uint32_t *pal32_ptr = 0;
 	if(ct == 3 && bd == 8) {
@@ -1564,16 +1429,11 @@ int pd_decode(uint8_t *data, size_t len, struct pd_image *out) {
 		size_t row_bytes = (width * bits_per_pixel + 7) / 8;
 		size_t stride = row_bytes + 1;
 		size_t raw_size = stride * height;
-		int raw_owned = raw_size < RAW_REUSE_MIN;
+		uint32_t raw_owned = raw_size < RAW_REUSE_MIN;
 		uint8_t *raw = raw_owned ? malloc(raw_size + COPY_PAD) : raw_grow(raw_size);
-		// Fused, streaming inflate -> unfilter -> expand. The big path drains rows
-		// through `sink` as soon as they fall a full window behind the inflate
-		// frontier (so they are cache-hot and can no longer be back-referenced);
-		// the sink_consume below flushes whatever is left (every row for the small
-		// non-streaming path, the final sub-window tail for the big path).
 		struct sink sink = { raw, pixels, 0, plte, trns, pal32_ptr, stride, row_bytes, 0, height, width, bpp, bd, out_ch, eff_trns, ct };
 		struct sink *sp = raw_size > STREAM_MIN ? &sink : 0;
-		int big = raw_size >= BIG_MIN ? (raw_size / 5 < idat_len / 2 ? 2 : 1) : 0;
+		uint32_t big = raw_size >= BIG_MIN ? (raw_size / 5 < idat_len / 2 ? 2 : 1) : 0;
 		if(!raw || inflate_stream(idat, idat_len, raw, raw_size, big, sp) != 0 || sink_consume(&sink, raw_size, 0) != 0) {
 			if(raw_owned) {
 				free(raw);
@@ -1585,9 +1445,8 @@ int pd_decode(uint8_t *data, size_t len, struct pd_image *out) {
 		if(raw_owned) {
 			free(raw);
 		}
+
 	} else {
-		// Adam7: the seven reduced images are concatenated in one zlib stream,
-		// each with its own filtered rows.
 		uint32_t pw[7], ph[7];
 		size_t prb[7], poff[7];
 		size_t raw_size = 0;
@@ -1604,10 +1463,10 @@ int pd_decode(uint8_t *data, size_t len, struct pd_image *out) {
 				maxw = pw[p];
 			}
 		}
-		int raw_owned = raw_size < RAW_REUSE_MIN;
+		uint32_t raw_owned = raw_size < RAW_REUSE_MIN;
 		uint8_t *raw = raw_owned ? malloc(raw_size + COPY_PAD) : raw_grow(raw_size);
 		uint8_t *temp = malloc((size_t)maxw * out_ch);
-		int big = raw_size >= BIG_MIN ? (raw_size / 5 < idat_len / 2 ? 2 : 1) : 0;
+		uint32_t big = raw_size >= BIG_MIN ? (raw_size / 5 < idat_len / 2 ? 2 : 1) : 0;
 		if(!raw || !temp || inflate_stream(idat, idat_len, raw, raw_size, big, 0) != 0) {
 			if(raw_owned) {
 				free(raw);
@@ -1617,7 +1476,7 @@ int pd_decode(uint8_t *data, size_t len, struct pd_image *out) {
 			free(pixels);
 			return 1;
 		}
-		int ok = 1;
+		uint32_t ok = 1;
 		for(uint32_t p = 0; p < 7; ++p) {
 			if(!pw[p] || !ph[p]) {
 				continue;
