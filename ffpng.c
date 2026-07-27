@@ -20,6 +20,13 @@ struct bitreader {
 // comb packs code length in 0..7, literal advance in 8..9, pair length in 10..13, EOB/LIT in 14/15, payload in 16..31; zero selects canonical decoding.
 #define COMB_LIT 0x8000u
 #define COMB_EOB 0x4000u
+#if 0
+// NOTE(peter): Enable only to compare the previous inflater on Zen 4 before ejecting it.
+#define TEST_ZEN4_INFLATER 1
+#endif
+#ifndef TEST_ZEN4_INFLATER
+#define TEST_ZEN4_INFLATER 0
+#endif
 struct huff {
 	uint16_t fast[1 << FAST_BITS];
 	uint32_t comb[1 << FAST12_BITS];
@@ -91,10 +98,10 @@ static uint32_t crc_ready;
 
 // Reuse avoids page faults above this threshold; smaller fixed-address buffers regress through 4K aliasing.
 #define RAW_REUSE_MIN (256 * 1024)
-// 32 KB regressed textures_pk from 1.184 to 1.158 because match-heavy palette data cannot amortize comb construction.
-#define BIG_MIN 131072
+// 64 KB amortizes comb construction on Zen 5 while retaining the small-stream path below it.
+#define BIG_MIN 65536
 // Padding makes unconditional vector stores safe; slop is overwritten before it can become output.
-#define COPY_PAD 16
+#define COPY_PAD 32
 static uint8_t *raw_scratch;
 static size_t raw_scratch_cap;
 
@@ -298,7 +305,11 @@ static int32_t huff_build(struct huff *h, uint8_t *lengths, uint32_t num, uint32
 				} else if(i - 257 < 29) {
 					uint32_t li = i - 257;
 					// Bits 25..29 preserve the length symbol for the cold tail without a canonical lookup.
+#if TEST_ZEN4_INFLATER
 					centry = ((uint32_t)length_extra[li] << 8) | ((uint32_t)length_base[li] << 16) | (li << 25) | len;
+#else
+					centry = (len + length_extra[li]) | (len << 8) | ((uint32_t)length_base[li] << 16) | (li << 25);
+#endif
 
 				} else {
 					centry = 0;
@@ -333,7 +344,11 @@ static int32_t huff_build(struct huff *h, uint8_t *lengths, uint32_t num, uint32
 			uint32_t f = h->fast[i];
 			uint32_t sym = f & 511, len = f >> 9;
 			if(f && sym < 30) {
+#if TEST_ZEN4_INFLATER
 				h->dist_comb[i] = len | ((uint32_t)dist_extra[sym] << 4) | ((uint32_t)dist_base[sym] << 8);
+#else
+				h->dist_comb[i] = (len + dist_extra[sym]) | (len << 8) | ((uint32_t)dist_base[sym] << 16);
+#endif
 
 			} else {
 				h->dist_comb[i] = 0;
@@ -392,8 +407,14 @@ static inline int32_t huff_decode_full(struct bitreader *b, struct huff *h) {
 		return 256;
 	}
 	if(e) {
+#if TEST_ZEN4_INFLATER
 		b->bitbuf >>= (uint8_t)e;
 		b->bitcnt -= (uint8_t)e;
+#else
+		uint32_t s = (e >> 8) & 15;
+		b->bitbuf >>= s;
+		b->bitcnt -= s;
+#endif
 		return (int32_t)(257 + ((e >> 25) & 0x1f));
 	}
 	uint32_t key = bit_reverse16((uint32_t)(b->bitbuf & 0xffff), 16);
@@ -444,7 +465,13 @@ static inline void copy_match(uint8_t *out, size_t pos, size_t distance, size_t 
 	uint8_t *src = out + pos - distance;
 	uint8_t *dst = out + pos;
 	uint8_t *end = dst + length;
-	if(distance >= 16) {
+	if(distance >= 32) {
+		_mm256_storeu_si256((__m256i *)dst, _mm256_loadu_si256((__m256i *)src));
+		for(size_t i = 32; i < length; i += 32) {
+			_mm256_storeu_si256((__m256i *)(dst + i), _mm256_loadu_si256((__m256i *)(src + i)));
+		}
+
+	} else if(distance >= 16) {
 		// COPY_PAD permits unconditional stores, and distance at least 16 keeps every source vector behind the write frontier.
 		_mm_storeu_si128((__m128i *)dst, _mm_loadu_si128((__m128i *)src));
 		for(size_t i = 16; i < length; i += 16) {
@@ -952,16 +979,28 @@ static int32_t sink_consume(struct sink *s, size_t pos, size_t window) {
 	return 0;
 }
 
+// [=]===^=[ refill_values ]===================================================[=]
+static inline void refill_values(uint8_t **in, uint8_t *end, uint64_t *bitbuf, uint32_t *bitcnt) {
+	if(*in + 8 <= end) {
+		uint64_t chunk;
+		memcpy(&chunk, *in, 8);
+		*bitbuf |= chunk << (uint8_t)*bitcnt;
+		uint32_t count = (uint8_t)*bitcnt;
+		uint32_t advance = (63 - count) >> 3;
+		*in += advance;
+		*bitcnt += advance << 3;
+	}
+}
+
 // [=]===^=[ inflate_block ]===================================================[=]
 // big selects the 12-bit cascade, and mode 2 delays its fourth lookup until three entries prove literal.
 static int32_t inflate_block(struct bitreader *restrict b, struct huff *lit, struct huff *dist, uint8_t *restrict out, size_t outsize, size_t *outpos, uint32_t big, struct sink *sink) {
+#if TEST_ZEN4_INFLATER
 	size_t pos = *outpos;
 	for(;;) {
 		if(big) {
-			// Indexing the unconsumed buffer pipelines three dependent literal-table loads across L1 latency.
 			refill(b);
 			uint32_t e1 = lit->comb[b->bitbuf & ((1u << FAST12_BITS) - 1)];
-			// Chunk boundaries amortize consumer table eviction while keeping consumed rows beyond the back-reference window.
 			for(;;) {
 				size_t chunk_end = outsize;
 				if(sink) {
@@ -972,7 +1011,6 @@ static int32_t inflate_block(struct bitreader *restrict b, struct huff *lit, str
 				}
 				while(b->in + 8 <= b->end && pos + 8 <= chunk_end) {
 					if(e1 & COMB_LIT) {
-						// Low-byte code lengths feed shrx directly without an extraction dependency.
 						uint32_t e2 = lit->comb[(b->bitbuf >> (uint8_t)e1) & ((1u << FAST12_BITS) - 1)];
 						uint32_t e3 = lit->comb[(b->bitbuf >> ((uint8_t)e1 + (uint8_t)e2)) & ((1u << FAST12_BITS) - 1)];
 						uint32_t e4 = 0;
@@ -1041,7 +1079,6 @@ static int32_t inflate_block(struct bitreader *restrict b, struct huff *lit, str
 						*outpos = pos;
 						return -1;
 					}
-					// Preloading after distance consumption overlaps next-iteration setup with match-copy store latency.
 					refill(b);
 					e1 = lit->comb[b->bitbuf & ((1u << FAST12_BITS) - 1)];
 					copy_match(out, pos, distance, length);
@@ -1110,6 +1147,200 @@ static int32_t inflate_block(struct bitreader *restrict b, struct huff *lit, str
 			return -1;
 		}
 	}
+#else
+	size_t pos = *outpos;
+	uint8_t *in = b->in;
+	uint8_t *end = b->end;
+	uint64_t bitbuf = b->bitbuf;
+	uint32_t bitcnt = b->bitcnt;
+	for(;;) {
+		if(big) {
+			// Indexing the unconsumed buffer pipelines three dependent literal-table loads across L1 latency.
+			refill_values(&in, end, &bitbuf, &bitcnt);
+			uint32_t e1 = lit->comb[bitbuf & ((1u << FAST12_BITS) - 1)];
+			// Chunk boundaries amortize consumer table eviction while keeping consumed rows beyond the back-reference window.
+			for(;;) {
+				size_t chunk_end = outsize;
+				if(sink) {
+					chunk_end = pos + STREAM_CHUNK;
+					if(chunk_end > outsize) {
+						chunk_end = outsize;
+					}
+				}
+				while(in + 8 <= end && pos + 8 <= chunk_end) {
+					if(__builtin_expect((e1 & COMB_LIT) != 0, 1)) {
+						// Low-byte code lengths feed shrx directly without an extraction dependency.
+						uint32_t e2 = lit->comb[(bitbuf >> (uint8_t)e1) & ((1u << FAST12_BITS) - 1)];
+						uint32_t e3 = lit->comb[(bitbuf >> ((uint8_t)e1 + (uint8_t)e2)) & ((1u << FAST12_BITS) - 1)];
+						uint32_t e4 = 0;
+						if(__builtin_expect(big == 1, 1)) {
+							e4 = lit->comb[(bitbuf >> ((uint8_t)e1 + (uint8_t)e2 + (uint8_t)e3)) & ((1u << FAST12_BITS) - 1)];
+						}
+						uint16_t v1 = (uint16_t)(e1 >> 16);
+						memcpy(out + pos, &v1, 2);
+						pos += (e1 >> 8) & 3;
+						if(__builtin_expect((e2 & COMB_LIT) != 0, 1)) {
+							uint16_t v2 = (uint16_t)(e2 >> 16);
+							memcpy(out + pos, &v2, 2);
+							pos += (e2 >> 8) & 3;
+							if(__builtin_expect((e3 & COMB_LIT) != 0, 1)) {
+								if(big > 1) {
+									e4 = lit->comb[(bitbuf >> ((uint8_t)e1 + (uint8_t)e2 + (uint8_t)e3)) & ((1u << FAST12_BITS) - 1)];
+								}
+								uint16_t v3 = (uint16_t)(e3 >> 16);
+								memcpy(out + pos, &v3, 2);
+								pos += (e3 >> 8) & 3;
+								bitbuf >>= (uint8_t)e1 + (uint8_t)e2 + (uint8_t)e3;
+								bitcnt -= e1 + e2 + e3;
+								e1 = e4;
+								refill_values(&in, end, &bitbuf, &bitcnt);
+								continue;
+							}
+							bitbuf >>= (uint8_t)e1 + (uint8_t)e2;
+							bitcnt -= e1 + e2;
+							e1 = e3;
+
+						} else {
+							bitbuf >>= (uint8_t)e1;
+							bitcnt -= e1;
+							e1 = e2;
+						}
+						refill_values(&in, end, &bitbuf, &bitcnt);
+					}
+					if(e1 == 0) {
+						break;
+					}
+					uint64_t saved = bitbuf;
+					uint32_t count = (uint8_t)e1;
+					bitbuf >>= count;
+					bitcnt -= e1;
+					if(e1 & COMB_EOB) {
+						bitcnt = (uint8_t)bitcnt;
+						b->in = in;
+						b->bitbuf = bitbuf;
+						b->bitcnt = bitcnt;
+						*outpos = pos;
+						return 0;
+					}
+					uint32_t code_bits = (e1 >> 8) & 15;
+					uint32_t extra = count - code_bits;
+					size_t length = ((e1 >> 16) & 0x1ff) + ((saved >> code_bits) & (((uint32_t)1 << extra) - 1));
+					uint32_t de = dist->dist_comb[bitbuf & ((1u << FAST_BITS) - 1)];
+					size_t distance;
+					if(de) {
+						uint64_t saved = bitbuf;
+						uint32_t count = (uint8_t)de;
+						uint32_t code_bits = (de >> 8) & 15;
+						uint32_t extra = count - code_bits;
+						bitbuf >>= count;
+						bitcnt -= de;
+						distance = (de >> 16) + ((saved >> code_bits) & (((uint32_t)1 << extra) - 1));
+
+					} else {
+						bitcnt = (uint8_t)bitcnt;
+						b->in = in;
+						b->bitbuf = bitbuf;
+						b->bitcnt = bitcnt;
+						int32_t dsym = huff_decode(b, dist);
+						if(dsym < 0 || dsym >= 30) {
+							*outpos = pos;
+							return -1;
+						}
+						distance = dist_base[dsym] + getbits(b, dist_extra[dsym]);
+						in = b->in;
+						bitbuf = b->bitbuf;
+						bitcnt = b->bitcnt;
+					}
+					if(distance > pos || pos + length > outsize) {
+						*outpos = pos;
+						return -1;
+					}
+					// Preloading after distance consumption overlaps next-iteration setup with match-copy store latency.
+					refill_values(&in, end, &bitbuf, &bitcnt);
+					e1 = lit->comb[bitbuf & ((1u << FAST12_BITS) - 1)];
+					copy_match(out, pos, distance, length);
+					pos += length;
+				}
+				if(in + 8 <= end && pos + 8 <= chunk_end) {
+					break;
+				}
+				if(sink) {
+					if(sink_consume(sink, pos, INFLATE_WINDOW) != 0) {
+						*outpos = pos;
+						return -1;
+					}
+					if(in + 8 <= end && chunk_end < outsize) {
+						continue;
+					}
+				}
+				break;
+			}
+
+		} else if(b->in + 8 <= b->end && pos + 3 <= outsize) {
+			refill(b);
+			int32_t sym = huff_decode_nf(b, lit);
+			if(sym < 256) {
+				out[pos++] = (uint8_t)sym;
+				sym = huff_decode_nf(b, lit);
+				if(sym < 256) {
+					out[pos++] = (uint8_t)sym;
+					sym = huff_decode_nf(b, lit);
+					if(sym < 256) {
+						out[pos++] = (uint8_t)sym;
+						continue;
+					}
+				}
+			}
+			if(sym == 256) {
+				*outpos = pos;
+				return 0;
+			}
+			if(sym < 0) {
+				*outpos = pos;
+				return -1;
+			}
+			if(do_match_small(b, (uint32_t)sym, dist, out, &pos, outsize)) {
+				*outpos = pos;
+				return -1;
+			}
+			continue;
+		}
+
+		if(big) {
+			bitcnt = (uint8_t)bitcnt;
+			b->in = in;
+			b->bitbuf = bitbuf;
+			b->bitcnt = bitcnt;
+		}
+		int32_t sym = big ? huff_decode_full(b, lit) : huff_decode(b, lit);
+		if(big) {
+			in = b->in;
+			bitbuf = b->bitbuf;
+			bitcnt = b->bitcnt;
+		}
+		if(sym < 256) {
+			if(sym < 0 || pos >= outsize) {
+				*outpos = pos;
+				return -1;
+			}
+			out[pos++] = (uint8_t)sym;
+			continue;
+		}
+		if(sym == 256) {
+			*outpos = pos;
+			return 0;
+		}
+		if(big ? do_match(b, (uint32_t)sym, dist, out, &pos, outsize) : do_match_small(b, (uint32_t)sym, dist, out, &pos, outsize)) {
+			*outpos = pos;
+			return -1;
+		}
+		if(big) {
+			in = b->in;
+			bitbuf = b->bitbuf;
+			bitcnt = b->bitcnt;
+		}
+	}
+#endif
 }
 
 // [=]===^=[ inflate_fixed_tables ]============================================[=]

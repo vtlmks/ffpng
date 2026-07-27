@@ -13,7 +13,7 @@ export PATH="$HOME/.cargo/bin:$PATH"
 # /stack-protector overhead stripped. -O2 (O3 is worse); generic-tuned gcc beats
 # clang and znver4 tuning on this scalar hot loop.
 DECFLAGS="-std=c99 -O2 -march=x86-64-v3 -mbmi -mbmi2 -mpclmul \
-	-falign-functions=32 -falign-loops=32 -fno-plt \
+	-falign-functions=32 -falign-loops=64:47 -funroll-all-loops -fno-plt \
 	-fwrapv -fno-stack-protector -fno-pie -fcf-protection=none \
 	-ffunction-sections -fdata-sections -fno-unwind-tables -fno-asynchronous-unwind-tables \
 	-U_FORTIFY_SOURCE -Wall -Wextra"
