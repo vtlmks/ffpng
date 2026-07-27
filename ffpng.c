@@ -1223,18 +1223,16 @@ static int32_t inflate_block(struct bitreader *restrict b, struct huff *lit, str
 						return 0;
 					}
 					uint32_t code_bits = (e1 >> 8) & 15;
-					uint32_t extra = count - code_bits;
-					size_t length = ((e1 >> 16) & 0x1ff) + ((saved >> code_bits) & (((uint32_t)1 << extra) - 1));
+					size_t length = ((e1 >> 16) & 0x1ff) + (_bzhi_u64(saved, count) >> code_bits);
 					uint32_t de = dist->dist_comb[bitbuf & ((1u << FAST_BITS) - 1)];
 					size_t distance;
 					if(de) {
 						uint64_t saved = bitbuf;
 						uint32_t count = (uint8_t)de;
 						uint32_t code_bits = (de >> 8) & 15;
-						uint32_t extra = count - code_bits;
 						bitbuf >>= count;
 						bitcnt -= de;
-						distance = (de >> 16) + ((saved >> code_bits) & (((uint32_t)1 << extra) - 1));
+						distance = (de >> 16) + (_bzhi_u64(saved, count) >> code_bits);
 
 					} else {
 						bitcnt = (uint8_t)bitcnt;
