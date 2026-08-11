@@ -77,7 +77,7 @@ static uint32_t cfg_max_iters = 2000;
 static uint32_t cfg_limit = 0;			// 0 == no limit
 static char *cfg_filter = 0;			// substring match on path, or null
 static char *cfg_csv = 0;
-static char *cfg_only = 0;			// run only this decoder name, or null
+static char *cfg_only = 0;			// run only these comma-separated decoder names, or null
 
 static char **paths = 0;
 static uint32_t path_count = 0;
@@ -438,6 +438,27 @@ static void collect_paths(char *dir) {
 	closedir(d);
 }
 
+// [=]===^=[ decoder_selected ]================================================[=]
+static uint32_t decoder_selected(char *name) {
+	if(!cfg_only) {
+		return 1;
+	}
+	size_t name_len = strlen(name);
+	char *p = cfg_only;
+	for(;;) {
+		char *end = strchr(p, ',');
+		size_t len = end ? (size_t)(end - p) : strlen(p);
+		if(len == name_len && memcmp(p, name, len) == 0) {
+			return 1;
+		}
+		if(!end) {
+			break;
+		}
+		p = end + 1;
+	}
+	return 0;
+}
+
 // [=]===^=[ bench_image ]=====================================================[=]
 // Times every decoder on one already-loaded PNG. The first decoder's output is
 // the reference; mismatches are reported and excluded from the aggregate.
@@ -458,7 +479,7 @@ static void bench_image(char *path, uint8_t *data, size_t len, uint32_t w, uint3
 
 	for(uint32_t di = 0; di < decoder_count; ++di) {
 		struct decoder *dec = &decoders[di];
-		if(cfg_only && strcmp(cfg_only, dec->name) != 0) {
+		if(!decoder_selected(dec->name)) {
 			continue;
 		}
 
@@ -521,7 +542,7 @@ static void report(void) {
 	printf("-----------------------------------------------------------------\n");
 	for(uint32_t di = 0; di < decoder_count; ++di) {
 		struct decoder *dec = &decoders[di];
-		if(cfg_only && strcmp(cfg_only, dec->name) != 0) {
+		if(!decoder_selected(dec->name)) {
 			continue;
 		}
 		double avg = dec->passed ? dec->sum_mpps / dec->passed : 0.0;

@@ -21,7 +21,7 @@ no third-party libraries.
 **Inflate** is most of the work and is where the speed is won or lost. A 64-bit
 refill bit reader feeds a two-level Huffman scheme: a 9-bit direct table for
 short codes with a canonical maxcode fallback for the rare long ones. For images
-whose raw (filtered) size clears 64 KB it also builds a 12-bit *combined* table
+whose raw (filtered) size clears 4 KB it also builds a 12-bit *combined* table
 whose every entry resolves in a single load to one or two literals, a match
 length base, or end-of-block. The literal path runs a four-deep speculative
 cascade: each lookup indexes an already-shifted window and produces the shift
@@ -37,8 +37,13 @@ range on dense data without selecting by image category, dimensions, or name.
 The combined table is built by incremental doubling: each symbol is placed once
 at its codeword, adjacent literal pairs are fused, and the table is doubled with
 one copy per added bit, instead of a strided per-symbol scatter. The match copy
-is a branchless 16-byte SIMD over-copy (a 16-byte tail slack on every buffer
-keeps the over-write in bounds) rather than a `memcpy` call.
+selects 32-byte AVX2, 16-byte SSE, 8-byte overlap propagation, or `memset`
+according to distance; padding makes its unconditional tail stores safe.
+
+The 4 KB cutoff is measured rather than assumed. On the Ryzen 9950X3D, lowering
+it from 64 KB improved the full corpus by 3.6% and `textures_pk` by 6.9%. The
+combined table lost 2.2% on the exact 2-to-4 KB crossover set, so smaller
+streams retain the 9-bit path.
 
 **CRC-32** folds the 16-byte-aligned bulk with `PCLMULQDQ` (the reflected
 algorithm), and finishes the sub-16-byte tail from a table.
@@ -67,8 +72,8 @@ git submodule update --init     # fetch the image-png competitor
 ```
 
 Needs:
-- `gcc` (tested 16.1) targeting `x86-64-v3` (AVX2 + BMI2) with PCLMUL
-- Rust `nightly` + `cargo` (image-png's `unstable` feature requires it)
+- `gcc` (tested 16.1 and 16.2) targeting `x86-64-v3` (AVX2 + BMI2) with PCLMUL
+- Rust `nightly` + `cargo` (image-png's `unstable` feature requires it; current follow-up uses 1.98.0-nightly `c1b22f44c`)
 - `libpng` and `zlib` (the benchmark also times libpng as a reference)
 - `libdeflate` and `libspng` (two more reference decoders the benchmark times)
 
@@ -115,7 +120,7 @@ AMD since 2017), and the AVX-512 path it skips would only have been slower here.
 ## Benchmark
 
 ```sh
-taskset -c 1 chrt -f 99 ./bench [--decoder NAME] [--csv FILE] images
+taskset -c 1 chrt -f 99 ./bench [--decoder NAME[,NAME...]] [--csv FILE] images
 python3 analyze.py FILE          # per-category ratios from a CSV
 ```
 
@@ -125,8 +130,8 @@ verifies correctness: the first decoder (image-png) is the oracle; every other
 decoder's output is converted to canonical RGBA8 outside the timing loop and
 `memcmp`'d against it.
 
-Without `--decoder`, all six run. `--decoder NAME` restricts the run to one,
-where `NAME` is one of:
+Without `--decoder`, all six run. `--decoder` accepts one name or a
+comma-separated list, where each `NAME` is one of:
 
 | `NAME`      | decoder                                       |
 |-------------|-----------------------------------------------|
@@ -285,6 +290,28 @@ MP/s in the same selected run; shifted windows measured 333.2 MP/s, a paired
 2.88% gain. Both decoder orders in separate full-corpus runs improved, and every
 category improved against that pre-change implementation.
 
+Lowering the combined-table threshold from 64 KB to its measured 4 KB
+crossover subsequently improved the current implementation from 332.2 to 344.1
+MP/s and from 332.0 to 344.1 MP/s in a 10 ms full-corpus A/B/B/A sequence. The
+current 20 ms interleaved `image-png,ffpng` run measured:
+
+| category        | ffpng | image-png | ratio |    N |
+|-----------------|------:|----------:|------:|-----:|
+| photo_wikipedia | 157.6 |     158.4 | 0.995 |   49 |
+| textures_photo  | 149.5 |     150.1 | 0.995 |   20 |
+| photo_tecnick   | 234.2 |     235.2 | 0.996 |  100 |
+| photo_kodak     | 161.4 |     150.4 | 1.073 |   24 |
+| pngimg          | 309.6 |     280.9 | 1.102 |  187 |
+| textures_plants | 251.6 |     226.9 | 1.109 |   60 |
+| icon_64         | 251.2 |     224.9 | 1.117 |  213 |
+| screenshot_game | 333.3 |     294.4 | 1.132 |  618 |
+| textures_pk02   | 183.8 |     159.5 | 1.152 |  235 |
+| textures_pk01   | 222.2 |     192.5 | 1.154 |  113 |
+| icon_512        | 467.0 |     398.1 | 1.173 |  213 |
+| textures_pk     | 493.9 |     389.8 | 1.267 | 1002 |
+| screenshot_web  | 715.6 |     409.6 | 1.747 |   14 |
+| **overall**     | **344.6** | **293.8** | **1.173** | 2848 |
+
 ## The limit
 
 Dense-literal data is limited by a serial recurrence: a symbol's position in the
@@ -298,16 +325,16 @@ MP/s, but that competitor ratio is not a hardware roofline. No port-pressure or
 load-latency roofline has been established, so further gains in this loop
 remain possible.
 
-Match-heavy data has separately measured headroom. In a 10 ms full-corpus
-diagnostic on the same boost-disabled Ryzen 9950X3D, the same front end using
-libdeflate inflate reached 506.4 MP/s on `textures_pk` against ffpng's 461.6,
-putting ffpng at 91.2% of that measured implementation bound. This is specific
-to that category: ffpng was already 1.9% ahead on `screenshot_game`, 44.0% ahead
-on `photo_tecnick`, and within 0.2% of libdeflate over the whole corpus. The
-remaining `textures_pk` limiter is the match-loop dependency and control
-structure rather than literal-table latency. Attempts to port pieces of
-libdeflate's loop have either netted nothing or charged more to the literal path
-than they saved, but the measured gap remains an optimization target.
+Small match-heavy data has separately measured headroom. In a direct 20 ms
+comparison on the same boost-disabled Ryzen 9950X3D, the same front end using
+libdeflate inflate reached 505.9 MP/s on `textures_pk` against ffpng's 493.9,
+putting ffpng at 97.6% of that measured implementation bound. ffpng is already
+1.5% ahead on the category's streams at least 64 KB and 15.6% ahead on its
+low-compression combined-table mode. The remaining shortfall is concentrated
+below 32 KB, where table construction is a larger fraction of decode time, and
+in the 62 files below 4 KB that retain the small-stream path. The competitor is
+still not a hardware roofline, so the limiting fractions are relative to that
+implementation rather than the machine.
 
 ## Layout
 

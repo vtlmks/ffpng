@@ -130,8 +130,8 @@ static uint32_t crc_table[256] = {
 
 // Reuse avoids page faults above this threshold; smaller fixed-address buffers regress through 4K aliasing.
 #define RAW_REUSE_MIN (256 * 1024)
-// 64 KB amortizes comb construction on Zen 5 while retaining the small-stream path below it.
-#define BIG_MIN 65536
+// 4 KB is the measured Zen 5 crossover where combined-table construction repays its fixed cost.
+#define BIG_MIN 4096
 // Padding makes unconditional vector stores safe; slop is overwritten before it can become output.
 #define COPY_PAD 32
 static _Thread_local uint8_t *raw_scratch;
