@@ -298,14 +298,16 @@ MP/s, but that competitor ratio is not a hardware roofline. No port-pressure or
 load-latency roofline has been established, so further gains in this loop
 remain possible.
 
-Match-heavy data has separately measured headroom. The same front end using
-libdeflate inflate reaches 510.2 MP/s on `textures_pk` against ffpng's 436.3,
-putting ffpng at 85.5% of that measured implementation bound; on
-`screenshot_game` it is at 93.6%. The remaining limiter there is the match-loop
-dependency and control structure rather than literal-table latency. Attempts to
-port pieces of libdeflate's loop have either netted nothing or charged more to
-the literal path than they saved, but the measured gap remains an optimization
-target.
+Match-heavy data has separately measured headroom. In a 10 ms full-corpus
+diagnostic on the same boost-disabled Ryzen 9950X3D, the same front end using
+libdeflate inflate reached 506.4 MP/s on `textures_pk` against ffpng's 461.6,
+putting ffpng at 91.2% of that measured implementation bound. This is specific
+to that category: ffpng was already 1.9% ahead on `screenshot_game`, 44.0% ahead
+on `photo_tecnick`, and within 0.2% of libdeflate over the whole corpus. The
+remaining `textures_pk` limiter is the match-loop dependency and control
+structure rather than literal-table latency. Attempts to port pieces of
+libdeflate's loop have either netted nothing or charged more to the literal path
+than they saved, but the measured gap remains an optimization target.
 
 ## Layout
 
