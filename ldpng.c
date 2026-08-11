@@ -16,16 +16,18 @@
 
 #define pd_decode pd_decode_ldunused
 #define pd_free   pd_free_ldunused
+#define pd_free_thread_cache pd_free_thread_cache_ldunused
 #include "ffpng.c"
 #undef pd_decode
 #undef pd_free
+#undef pd_free_thread_cache
 
 // [=]===^=[ globals ]=========================================================[=]
 
-static struct libdeflate_decompressor *ld_decompressor;
+static _Thread_local struct libdeflate_decompressor *ld_decompressor;
 
-static uint8_t *ld_raw;
-static size_t ld_raw_cap;
+static _Thread_local uint8_t *ld_raw;
+static _Thread_local size_t ld_raw_cap;
 
 // [=]===^=[ ld_raw_grow ]=====================================================[=]
 // Grow-only scratch for the filtered raw bytes, mirroring ffpng's raw_scratch
@@ -45,9 +47,6 @@ static uint8_t *ld_raw_grow(size_t n) {
 // distinct decoder), calling into the shared static helpers from ffpng.c.
 int ldpng_decode(uint8_t *data, size_t len, struct pd_image *out) {
 	static const uint8_t sig[8] = { 0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a };
-	if(!crc_ready) {
-		crc_build();
-	}
 	if(!ld_decompressor) {
 		ld_decompressor = libdeflate_alloc_decompressor();
 	}

@@ -13,8 +13,12 @@ struct pd_image {
 	uint8_t channels;
 };
 
-// Decodes a complete PNG from memory. Returns 0 on success; on success the
-// caller owns `out->pixels` and frees it with pd_free.
+// Decodes a complete PNG from memory. Concurrent calls are safe. Returns 0 on
+// success; on success the caller owns `out->pixels` and frees it with pd_free.
 int pd_decode(uint8_t *data, size_t len, struct pd_image *out);
 
 void pd_free(struct pd_image *img);
+
+// Releases the calling thread's decode scratch cache. Call before terminating
+// short-lived worker threads; stable worker pools can retain it for reuse.
+void pd_free_thread_cache(void);

@@ -21,16 +21,15 @@ no third-party libraries.
 **Inflate** is most of the work and is where the speed is won or lost. A 64-bit
 refill bit reader feeds a two-level Huffman scheme: a 9-bit direct table for
 short codes with a canonical maxcode fallback for the rare long ones. For images
-whose raw (filtered) size clears 128 KB it also builds a 12-bit *combined* table
+whose raw (filtered) size clears 64 KB it also builds a 12-bit *combined* table
 whose every entry resolves in a single load to one or two literals, a match
 length base, or end-of-block. The literal path runs a four-deep speculative
-cascade: the next three table loads are issued from the still-unconsumed bit
-buffer so their L1 latencies pipeline, and up to three literals are emitted
-before one consume-and-refill. This structure is modeled on `fdeflate`,
-image-png's inflate backend. Each entry keeps its code length in the low byte,
-so advancing the bit buffer to the next speculative load is a single shift with
-no extraction: the serial literal-decode chain, which is the whole cost on
-dense-literal photographs, stays one shift per symbol. On large streams whose
+cascade: each lookup indexes an already-shifted window and produces the shift
+count for the next window, so the serial recurrence is one `shrx` and one L1
+load per entry without cumulative-count extraction or addition. Up to three
+literals are emitted before one refill. This structure is modeled on
+`fdeflate`, image-png's inflate backend. Each entry keeps its code length in the
+low byte so the packed entry feeds `shrx` directly. On large streams whose
 raw-to-compressed ratio is below 2.5, the fourth speculative lookup is delayed
 until the first three entries have proved to be literals. That shortens its live
 range on dense data without selecting by image category, dimensions, or name.
@@ -210,6 +209,8 @@ core, read through the ratio, measures what actually moves.
 
 ## Numbers
 
+### Published Ryzen 7950X run
+
 Ryzen 7950X, single core at real-time priority, boost off, gcc 16.1, image-png
 v0.18.1 `--features=unstable` at `target-cpu=x86-64-v3`, 2848 images. Both
 decoders are pure AVX2. Sorted worst-first. `ffpng` and `image-png` are geomean
@@ -253,16 +254,49 @@ tradeoff was a 0.5% to 0.7% loss on the highly compressible checkerboard, where
 ffpng remained 31% ahead of image-png. The holdout is a generalization check,
 not part of the published QOI aggregate.
 
+### Ryzen 9950X3D follow-up
+
+Ryzen 9950X3D, isolated CPU 9 at real-time priority, boost off, gcc 16.1,
+image-png v0.18.1 at `target-cpu=x86-64-v3`, and the same 2848-image corpus. The
+50 ms interleaved run measured:
+
+| category        | ffpng | image-png | ratio |    N |
+|-----------------|------:|----------:|------:|-----:|
+| icon_64         | 218.4 |     226.2 | 0.966 |  213 |
+| photo_wikipedia | 157.7 |     158.5 | 0.995 |   49 |
+| photo_tecnick   | 234.7 |     235.1 | 0.998 |  100 |
+| textures_photo  | 149.3 |     149.3 | 1.000 |   20 |
+| photo_kodak     | 163.5 |     150.7 | 1.085 |   24 |
+| pngimg          | 309.9 |     281.7 | 1.100 |  187 |
+| screenshot_game | 334.1 |     300.1 | 1.114 |  618 |
+| textures_plants | 253.1 |     226.9 | 1.115 |   60 |
+| textures_pk     | 461.8 |     412.6 | 1.119 | 1002 |
+| textures_pk02   | 181.5 |     159.9 | 1.135 |  235 |
+| textures_pk01   | 223.3 |     193.0 | 1.157 |  113 |
+| icon_512        | 469.9 |     398.5 | 1.179 |  213 |
+| screenshot_web  | 726.4 |     412.7 | 1.760 |   14 |
+| **overall**     | **333.2** | **301.3** | **1.106** | 2848 |
+
+The exact implementation from the published Zen 4 run initially produced only
+a 1.0298 overall ratio on this processor. That was retained as unresolved
+regression data rather than presented as a replacement result. Immediately
+before the shifted-window change, the current implementation measured 323.9
+MP/s in the same selected run; shifted windows measured 333.2 MP/s, a paired
+2.88% gain. Both decoder orders in separate full-corpus runs improved, and every
+category improved against that pre-change implementation.
+
 ## The limit
 
 Dense-literal data is limited by a serial recurrence: a symbol's position in the
 bitstream is known only after the previous symbol's code length, so the Huffman
 table-load addresses form a dependent chain dominated by L1 load-use latency.
-Delaying the fourth lookup reduces live-range pressure but does not remove that
-dependency. ffpng reaches 225.3 MP/s on `photo_tecnick`, 103.1% of image-png's
-measured 218.4 MP/s, but that competitor ratio is not a hardware roofline. No
-port-pressure or load-latency roofline has been established, so further gains in
-this loop remain possible.
+Carrying shifted windows removes cumulative-count work from that chain, and
+delaying the fourth lookup reduces live-range pressure, but neither removes the
+load-use dependency. In the boost-disabled Ryzen 9950X3D follow-up, ffpng
+reaches 234.7 MP/s on `photo_tecnick`, 99.8% of image-png's measured 235.1
+MP/s, but that competitor ratio is not a hardware roofline. No port-pressure or
+load-latency roofline has been established, so further gains in this loop
+remain possible.
 
 Match-heavy data has separately measured headroom. The same front end using
 libdeflate inflate reaches 510.2 MP/s on `textures_pk` against ffpng's 436.3,
