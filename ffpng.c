@@ -237,8 +237,39 @@ static int32_t huff_build(struct huff *h, uint8_t *lengths, uint32_t num, uint32
 	if(mode != 1) {
 		memset(h->fast, 0, sizeof(h->fast));
 	}
-	for(uint32_t i = 0; i < num; ++i) {
-		sizes[lengths[i]]++;
+	if(mode == 2) {
+		memset(h->dist_comb, 0, sizeof(h->dist_comb));
+	}
+	uint32_t i = 0;
+	if(mode == 1) {
+		uint32_t sizes_alt[17] = { 0 };
+		for(; i + 1 < num; i += 2) {
+			sizes[lengths[i]]++;
+			sizes_alt[lengths[i + 1]]++;
+		}
+		if(i < num) {
+			sizes[lengths[i]]++;
+		}
+		for(i = 0; i < 17; ++i) {
+			sizes[i] += sizes_alt[i];
+		}
+
+	} else {
+		uint32_t sizes_alt[17] = { 0 };
+		uint32_t sizes_alt2[17] = { 0 };
+		uint32_t sizes_alt3[17] = { 0 };
+		for(; i + 3 < num; i += 4) {
+			sizes[lengths[i]]++;
+			sizes_alt[lengths[i + 1]]++;
+			sizes_alt2[lengths[i + 2]]++;
+			sizes_alt3[lengths[i + 3]]++;
+		}
+		for(; i < num; ++i) {
+			sizes[lengths[i]]++;
+		}
+		for(i = 0; i < 17; ++i) {
+			sizes[i] += sizes_alt[i] + sizes_alt2[i] + sizes_alt3[i];
+		}
 	}
 	sizes[0] = 0;
 	for(uint32_t i = 1; i < 16; ++i) {
@@ -262,26 +293,46 @@ static int32_t huff_build(struct huff *h, uint8_t *lengths, uint32_t num, uint32
 	}
 	h->maxcode[16] = 0x10000;
 
-	for(uint32_t i = 0; i < num; ++i) {
-		uint32_t s = lengths[i];
-		if(s) {
-			uint32_t c = next_code[s] - h->firstcode[s] + h->firstsymbol[s];
-			h->size[c] = (uint8_t)s;
-			h->value[c] = (uint16_t)i;
-			// mode 1 never reads fast, so its strided scatter is dead work.
-			if(mode != 1 && s <= FAST_BITS) {
-				uint32_t j = bit_reverse16(next_code[s], s);
-				while(j < (1u << FAST_BITS)) {
+	if(mode != 1) {
+		for(uint32_t i = 0; i < num; ++i) {
+			uint32_t s = lengths[i];
+			if(s) {
+				if(s > FAST_BITS) {
+					uint32_t c = next_code[s] - h->firstcode[s] + h->firstsymbol[s];
+					h->size[c] = (uint8_t)s;
+					h->value[c] = (uint16_t)i;
+				}
+				if(s <= FAST_BITS) {
+					uint32_t j = bit_reverse16(next_code[s], s);
+					uint16_t fast_entry;
 					if(mode == 3) {
-						h->fast[j] = (uint16_t)(s | ((uint32_t)dist_extra[i] << 4) | (i << 8));
+						fast_entry = (uint16_t)(s | ((uint32_t)dist_extra[i] << 4) | (i << 8));
 
 					} else {
-						h->fast[j] = (uint16_t)((s << 9) | i);
+						fast_entry = (uint16_t)((s << 9) | i);
 					}
-					j += 1u << s;
+					if(mode == 2 && i < 30) {
+						uint32_t dist_entry;
+#if TEST_ZEN4_INFLATER
+						dist_entry = s | ((uint32_t)dist_extra[i] << 4) | ((uint32_t)dist_base[i] << 8);
+#else
+						dist_entry = (s + dist_extra[i]) | (s << 8) | ((uint32_t)dist_base[i] << 16);
+#endif
+						while(j < (1u << FAST_BITS)) {
+							h->fast[j] = fast_entry;
+							h->dist_comb[j] = dist_entry;
+							j += 1u << s;
+						}
+
+					} else {
+						while(j < (1u << FAST_BITS)) {
+							h->fast[j] = fast_entry;
+							j += 1u << s;
+						}
+					}
 				}
+				next_code[s]++;
 			}
-			next_code[s]++;
 		}
 	}
 
@@ -302,6 +353,12 @@ static int32_t huff_build(struct huff *h, uint8_t *lengths, uint32_t num, uint32
 		for(uint32_t i = 0; i < num; ++i) {
 			uint32_t s = lengths[i];
 			if(s) {
+				if(s > FAST12_BITS) {
+					uint32_t c = next_code[s] - h->firstcode[s] + h->firstsymbol[s];
+					h->size[c] = (uint8_t)s;
+					h->value[c] = (uint16_t)i;
+				}
+				next_code[s]++;
 				sorted[fill[s]++] = (uint16_t)i;
 				if(i < 256) {
 					++lit_sizes[s];
@@ -358,22 +415,6 @@ static int32_t huff_build(struct huff *h, uint8_t *lengths, uint32_t num, uint32
 			}
 		}
 
-	} else if(mode == 2) {
-		// Zero distance entries select the canonical path for codes longer than nine bits.
-		for(uint32_t i = 0; i < (1u << FAST_BITS); ++i) {
-			uint32_t f = h->fast[i];
-			uint32_t sym = f & 511, len = f >> 9;
-			if(f && sym < 30) {
-#if TEST_ZEN4_INFLATER
-				h->dist_comb[i] = len | ((uint32_t)dist_extra[sym] << 4) | ((uint32_t)dist_base[sym] << 8);
-#else
-				h->dist_comb[i] = (len + dist_extra[sym]) | (len << 8) | ((uint32_t)dist_base[sym] << 16);
-#endif
-
-			} else {
-				h->dist_comb[i] = 0;
-			}
-		}
 	}
 	return 0;
 }

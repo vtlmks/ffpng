@@ -36,9 +36,15 @@ range on dense data without selecting by image category, dimensions, or name.
 
 The combined table is built by incremental doubling: each symbol is placed once
 at its codeword, adjacent literal pairs are fused, and the table is doubled with
-one copy per added bit, instead of a strided per-symbol scatter. The match copy
-selects 32-byte AVX2, 16-byte SSE, 8-byte overlap propagation, or `memset`
-according to distance; padding makes its unconditional tail stores safe.
+one copy per added bit, instead of a strided per-symbol scatter. Sorting and
+canonical-fallback construction share one pass, and codes covered by a direct
+table do not populate the fallback arrays. Code-length histograms use two
+interleaved accumulators for the 288-symbol combined tree and four for the
+smaller trees, breaking the repeated-bin dependency before one final reduction.
+Packed distance entries are formed once per symbol and written beside the fast
+table during the same scatter. The match copy selects 32-byte AVX2, 16-byte SSE,
+8-byte overlap propagation, or `memset` according to distance; padding makes its
+unconditional tail stores safe.
 
 The 4 KB cutoff is measured rather than assumed. On the Ryzen 9950X3D, lowering
 it from 64 KB improved the full corpus by 3.6% and `textures_pk` by 6.9%. The
@@ -293,24 +299,30 @@ category improved against that pre-change implementation.
 Lowering the combined-table threshold from 64 KB to its measured 4 KB
 crossover subsequently improved the current implementation from 332.2 to 344.1
 MP/s and from 332.0 to 344.1 MP/s in a 10 ms full-corpus A/B/B/A sequence. The
-current 20 ms interleaved `image-png,ffpng` run measured:
+Huffman-builder changes then improved the committed 4 KB implementation from
+344.318 to 350.032 MP/s in a controlled 10 ms full-corpus comparison, a 1.659%
+gain. All 13 categories improved; `textures_pk` gained 2.44%, and the exact
+4-to-32 KB set gained 3.59% in paired 20 ms runs.
+
+The current 10 ms interleaved `image-png,ffpng` run, split into bounded chunks
+without changing per-image timing, measured:
 
 | category        | ffpng | image-png | ratio |    N |
 |-----------------|------:|----------:|------:|-----:|
-| photo_wikipedia | 157.6 |     158.4 | 0.995 |   49 |
-| textures_photo  | 149.5 |     150.1 | 0.995 |   20 |
-| photo_tecnick   | 234.2 |     235.2 | 0.996 |  100 |
-| photo_kodak     | 161.4 |     150.4 | 1.073 |   24 |
-| pngimg          | 309.6 |     280.9 | 1.102 |  187 |
-| textures_plants | 251.6 |     226.9 | 1.109 |   60 |
-| icon_64         | 251.2 |     224.9 | 1.117 |  213 |
-| screenshot_game | 333.3 |     294.4 | 1.132 |  618 |
-| textures_pk02   | 183.8 |     159.5 | 1.152 |  235 |
-| textures_pk01   | 222.2 |     192.5 | 1.154 |  113 |
-| icon_512        | 467.0 |     398.1 | 1.173 |  213 |
-| textures_pk     | 493.9 |     389.8 | 1.267 | 1002 |
-| screenshot_web  | 715.6 |     409.6 | 1.747 |   14 |
-| **overall**     | **344.6** | **293.8** | **1.173** | 2848 |
+| photo_wikipedia | 159.6 |     158.6 | 1.006 |   49 |
+| textures_photo  | 151.9 |     150.4 | 1.010 |   20 |
+| photo_tecnick   | 239.6 |     235.7 | 1.016 |  100 |
+| photo_kodak     | 163.9 |     150.2 | 1.091 |   24 |
+| pngimg          | 312.5 |     281.9 | 1.109 |  187 |
+| textures_plants | 256.1 |     227.7 | 1.125 |   60 |
+| screenshot_game | 335.9 |     294.3 | 1.141 |  618 |
+| textures_pk01   | 222.8 |     192.4 | 1.158 |  113 |
+| icon_64         | 261.1 |     224.9 | 1.161 |  213 |
+| textures_pk02   | 184.8 |     159.0 | 1.162 |  235 |
+| icon_512        | 463.7 |     395.6 | 1.172 |  213 |
+| textures_pk     | 505.4 |     385.8 | 1.310 | 1002 |
+| screenshot_web  | 737.0 |     417.1 | 1.767 |   14 |
+| **overall**     | **349.8** | **292.6** | **1.195** | 2848 |
 
 ## The limit
 
@@ -320,21 +332,20 @@ table-load addresses form a dependent chain dominated by L1 load-use latency.
 Carrying shifted windows removes cumulative-count work from that chain, and
 delaying the fourth lookup reduces live-range pressure, but neither removes the
 load-use dependency. In the boost-disabled Ryzen 9950X3D follow-up, ffpng
-reaches 234.7 MP/s on `photo_tecnick`, 99.8% of image-png's measured 235.1
+reaches 239.6 MP/s on `photo_tecnick`, 101.6% of image-png's measured 235.7
 MP/s, but that competitor ratio is not a hardware roofline. No port-pressure or
 load-latency roofline has been established, so further gains in this loop
 remain possible.
 
-Small match-heavy data has separately measured headroom. In a direct 20 ms
+Small match-heavy data has separately measured headroom. In a controlled 10 ms
 comparison on the same boost-disabled Ryzen 9950X3D, the same front end using
-libdeflate inflate reached 505.9 MP/s on `textures_pk` against ffpng's 493.9,
-putting ffpng at 97.6% of that measured implementation bound. ffpng is already
-1.5% ahead on the category's streams at least 64 KB and 15.6% ahead on its
-low-compression combined-table mode. The remaining shortfall is concentrated
-below 32 KB, where table construction is a larger fraction of decode time, and
-in the 62 files below 4 KB that retain the small-stream path. The competitor is
-still not a hardware roofline, so the limiting fractions are relative to that
-implementation rather than the machine.
+libdeflate inflate reached 506.6 MP/s on `textures_pk` against ffpng's 504.6,
+putting ffpng at 99.6% of that measured implementation bound. ffpng is 2.9%
+ahead on the 4-to-32 KB set. The remaining shortfall is concentrated in the 62
+files below 4 KB that retain the small-stream path: 398.8 MP/s against 473.1,
+or 84.3% of the implementation bound. The competitor is still not a hardware
+roofline, so the limiting fractions are relative to that implementation rather
+than the machine.
 
 ## Layout
 
