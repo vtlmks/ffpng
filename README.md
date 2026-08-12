@@ -42,9 +42,11 @@ table do not populate the fallback arrays. Code-length histograms use two
 interleaved accumulators for the 288-symbol combined tree and four for the
 smaller trees, breaking the repeated-bin dependency before one final reduction.
 Packed distance entries are formed once per symbol and written beside the fast
-table during the same scatter. The match copy selects 32-byte AVX2, 16-byte SSE,
-8-byte overlap propagation, or `memset` according to distance; padding makes its
-unconditional tail stores safe.
+table during the same scatter. The 9-bit builders maintain each next canonical
+code in reversed form and advance it by carry propagation instead of reversing
+every symbol. The match copy selects 32-byte AVX2, 16-byte SSE, 8-byte overlap
+propagation, or `memset` according to distance; padding makes its unconditional
+tail stores safe.
 
 The 4 KB cutoff is measured rather than assumed. On the Ryzen 9950X3D, lowering
 it from 64 KB improved the full corpus by 3.6% and `textures_pk` by 6.9%. The
@@ -304,6 +306,15 @@ Huffman-builder changes then improved the committed 4 KB implementation from
 gain. All 13 categories improved; `textures_pk` gained 2.44%, and the exact
 4-to-32 KB set gained 3.59% in paired 20 ms runs.
 
+Maintaining incrementally reversed canonical codes subsequently improved the
+62-file sub-4 KB set from 84.4% to 86.9% of the `ldpng` implementation bound in
+a production-order 10 ms A/B/B/A comparison, a 2.962% paired-ratio gain. The
+final geomeans were 409.5 versus 471.2 MP/s. A zero-loss cycles profile put
+`huff_build` at 13.29%, down from 14.12%. Sorting and doubling the direct tables
+reduced builder samples further in an experimental link, but regressed the
+production layout; forcing 1 KB code alignment made the result placement
+dependent and was rejected.
+
 The current 10 ms interleaved `image-png,ffpng` run, split into bounded chunks
 without changing per-image timing, measured:
 
@@ -342,8 +353,8 @@ comparison on the same boost-disabled Ryzen 9950X3D, the same front end using
 libdeflate inflate reached 506.6 MP/s on `textures_pk` against ffpng's 504.6,
 putting ffpng at 99.6% of that measured implementation bound. ffpng is 2.9%
 ahead on the 4-to-32 KB set. The remaining shortfall is concentrated in the 62
-files below 4 KB that retain the small-stream path: 398.8 MP/s against 473.1,
-or 84.3% of the implementation bound. The competitor is still not a hardware
+files below 4 KB that retain the small-stream path: 409.5 MP/s against 471.2,
+or 86.9% of the implementation bound. The competitor is still not a hardware
 roofline, so the limiting fractions are relative to that implementation rather
 than the machine.
 

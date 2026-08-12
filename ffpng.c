@@ -234,6 +234,7 @@ static inline uint32_t bit_reverse16(uint32_t v, uint32_t bits) {
 static int32_t huff_build(struct huff *h, uint8_t *lengths, uint32_t num, uint32_t mode) {
 	uint32_t sizes[17] = { 0 };
 	uint32_t next_code[16];
+	uint32_t next_rev[10];
 	if(mode != 1) {
 		memset(h->fast, 0, sizeof(h->fast));
 	}
@@ -292,6 +293,13 @@ static int32_t huff_build(struct huff *h, uint8_t *lengths, uint32_t num, uint32
 		k += sizes[i];
 	}
 	h->maxcode[16] = 0x10000;
+	if(mode != 1) {
+		for(uint32_t i = 1; i <= FAST_BITS; ++i) {
+			if(sizes[i]) {
+				next_rev[i] = bit_reverse16(next_code[i], i);
+			}
+		}
+	}
 
 	if(mode != 1) {
 		for(uint32_t i = 0; i < num; ++i) {
@@ -301,9 +309,10 @@ static int32_t huff_build(struct huff *h, uint8_t *lengths, uint32_t num, uint32
 					uint32_t c = next_code[s] - h->firstcode[s] + h->firstsymbol[s];
 					h->size[c] = (uint8_t)s;
 					h->value[c] = (uint16_t)i;
+					next_code[s]++;
 				}
 				if(s <= FAST_BITS) {
-					uint32_t j = bit_reverse16(next_code[s], s);
+					uint32_t j = next_rev[s];
 					uint16_t fast_entry;
 					if(mode == 3) {
 						fast_entry = (uint16_t)(s | ((uint32_t)dist_extra[i] << 4) | (i << 8));
@@ -330,8 +339,13 @@ static int32_t huff_build(struct huff *h, uint8_t *lengths, uint32_t num, uint32
 							j += 1u << s;
 						}
 					}
+					uint32_t bit = 1u << (s - 1);
+					while(next_rev[s] & bit) {
+						next_rev[s] ^= bit;
+						bit >>= 1;
+					}
+					next_rev[s] ^= bit;
 				}
-				next_code[s]++;
 			}
 		}
 	}
