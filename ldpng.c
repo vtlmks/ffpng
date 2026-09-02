@@ -2,22 +2,24 @@
 // SPDX-License-Identifier: MIT
 //
 // libdeflate-backed PNG decoder used ONLY as a benchmark reference. It reuses
-// ffpng's exact chunk parse, unfilter and expand by including ffpng.c, and
+// ffpng's exact chunk parse, unfilter and expand by including ffpng.h, and
 // swaps the one component under test: the inflate engine becomes a single
 // libdeflate_zlib_decompress call instead of ffpng's own inflate_stream. So a
 // head-to-head ldpng-vs-ffpng number isolates the inflate engine and nothing
 // else (identical CRC, unfilter, palette/expand code paths).
 //
-// ffpng.c's two public symbols are macro-renamed before the include so this
-// translation unit does not collide with the real ffpng.o at link time; the
-// renamed copies are unreferenced and dropped by --gc-sections.
+// ffpng.h's public symbols are macro-renamed before the include so this
+// translation unit does not collide with the benchmark's ffpng symbols at link
+// time; the renamed copies are unreferenced and dropped by --gc-sections.
 
 #include <libdeflate.h>
 
 #define pd_decode pd_decode_ldunused
 #define pd_free   pd_free_ldunused
 #define pd_free_thread_cache pd_free_thread_cache_ldunused
-#include "ffpng.c"
+#define FFPNG_IMPLEMENTATION
+#include "ffpng.h"
+#undef FFPNG_IMPLEMENTATION
 #undef pd_decode
 #undef pd_free
 #undef pd_free_thread_cache
@@ -44,7 +46,7 @@ static uint8_t *ld_raw_grow(size_t n) {
 // [=]===^=[ ldpng_decode ]====================================================[=]
 // Same as ffpng's pd_decode but inflate is libdeflate. Chunk parse and the
 // unfilter/expand orchestration are deliberately duplicated here (this is a
-// distinct decoder), calling into the shared static helpers from ffpng.c.
+// distinct decoder), calling into the shared static helpers from ffpng.h.
 int ldpng_decode(uint8_t *data, size_t len, struct pd_image *out) {
 	static const uint8_t sig[8] = { 0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a };
 	if(!ld_decompressor) {

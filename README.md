@@ -15,8 +15,8 @@ verified byte-for-byte against image-png on all 2848 corpus images.
 
 ## How it works
 
-The decoder is one translation unit, `ffpng.c`, libc and `<immintrin.h>` only,
-no third-party libraries.
+The decoder is a single-header library, `ffpng.h`, using libc and
+`<immintrin.h>` only, with no third-party libraries.
 
 **Inflate** is most of the work and is where the speed is won or lost. A 64-bit
 refill bit reader feeds a two-level Huffman scheme: a 9-bit direct table for
@@ -53,8 +53,9 @@ it from 64 KB improved the full corpus by 3.6% and `textures_pk` by 6.9%. The
 combined table lost 2.2% on the exact 2-to-4 KB crossover set, so smaller
 streams retain the 9-bit path.
 
-**CRC-32** folds the 16-byte-aligned bulk with `PCLMULQDQ` (the reflected
-algorithm), and finishes the sub-16-byte tail from a table.
+**CRC-32** folds four independent XMM accumulators over 64-byte groups with
+`PCLMULQDQ` (the reflected algorithm), collapses them to one, and finishes the
+sub-16-byte tail from a table.
 
 **Unfilter** is SSE/AVX2. Up is a flat 32-byte vertical add. Sub, Average, and
 Paeth are per-pixel, since the left-neighbour dependency is serial; Sub and
@@ -74,6 +75,17 @@ image-png in both regimes, but by only about 3% on the two densest photo sets.
 
 ## Build
 
+Include `ffpng.h` normally for its declarations. In exactly one translation
+unit, define `FFPNG_IMPLEMENTATION` first to emit the implementation:
+
+```c
+#define FFPNG_IMPLEMENTATION
+#include "ffpng.h"
+```
+
+The repository benchmark emits the implementation directly into its translation
+unit.
+
 ```sh
 git submodule update --init     # fetch the image-png competitor
 ./build.sh
@@ -90,14 +102,14 @@ this workload clang runs about 10% slower: it schedules the SIMD unfilter worse
 and inlines the match path less aggressively than gcc.
 
 `build.sh` builds the image-png shim staticlib with cargo (a no-op when nothing
-changed), compiles `ffpng.o`, `ldpng.o`, and `bench.o`, and links `./bench`. The competitor is
-the genuine, unmodified `image-rs/image-png` repository, vendored as a git
-submodule at `ext/image-png` pinned to the exact commit benchmarked (`4ab5484`,
-v0.18.1). It is built with `--features=unstable` and `target-cpu=x86-64-v3`, the
-same AVX2 instruction set as ffpng and image-png's fastest configuration on Zen 4
-(`target-cpu=native` emits AVX-512, which measured ~9% slower; see below). So the
-comparison is against image-png at its best, on equal instruction set, not a
-hobbled build.
+changed), compiles `ldpng.o` and `bench.o`, and links `./bench`. The
+competitor is the genuine, unmodified `image-rs/image-png` repository, vendored
+as a git submodule at `ext/image-png` pinned to the exact commit benchmarked
+(`4ab5484`, v0.18.1). It is built with `--features=unstable` and
+`target-cpu=x86-64-v3`, the same AVX2 instruction set as ffpng and image-png's
+fastest configuration on Zen 4 (`target-cpu=native` emits AVX-512, which
+measured ~9% slower; see below). So the comparison is against image-png at its
+best, on equal instruction set, not a hobbled build.
 
 ## AVX2, not AVX-512
 
@@ -110,7 +122,7 @@ none, and so does ffpng:
 ```sh
 # the benchmarked x86-64-v3 builds: no AVX-512
 objdump -d ext/shim/target/release/libimagepng_shim.a | grep -c '%zmm'   # 0
-objdump -d ffpng.o                                     | grep -c '%zmm'   # 0
+objdump -d bench.o                                     | grep -c '%zmm'   # 0
 # rebuild the shim with target-cpu=native and image-png emits ~950 zmm uses
 ```
 
@@ -315,25 +327,25 @@ reduced builder samples further in an experimental link, but regressed the
 production layout; forcing 1 KB code alignment made the result placement
 dependent and was rejected.
 
-The current 10 ms interleaved `image-png,ffpng` run, split into bounded chunks
-without changing per-image timing, measured:
+The current 10 ms interleaved `image-png,ffpng` run on 2026-09-02 used the same
+isolated CPU 9 and boost-off setup with gcc 16.2.1. It measured:
 
 | category        | ffpng | image-png | ratio |    N |
 |-----------------|------:|----------:|------:|-----:|
-| photo_wikipedia | 159.6 |     158.6 | 1.006 |   49 |
-| textures_photo  | 151.9 |     150.4 | 1.010 |   20 |
-| photo_tecnick   | 239.6 |     235.7 | 1.016 |  100 |
-| photo_kodak     | 163.9 |     150.2 | 1.091 |   24 |
-| pngimg          | 312.5 |     281.9 | 1.109 |  187 |
-| textures_plants | 256.1 |     227.7 | 1.125 |   60 |
-| screenshot_game | 335.9 |     294.3 | 1.141 |  618 |
-| textures_pk01   | 222.8 |     192.4 | 1.158 |  113 |
-| icon_64         | 261.1 |     224.9 | 1.161 |  213 |
-| textures_pk02   | 184.8 |     159.0 | 1.162 |  235 |
-| icon_512        | 463.7 |     395.6 | 1.172 |  213 |
-| textures_pk     | 505.4 |     385.8 | 1.310 | 1002 |
-| screenshot_web  | 737.0 |     417.1 | 1.767 |   14 |
-| **overall**     | **349.8** | **292.6** | **1.195** | 2848 |
+| photo_wikipedia | 162.1 |     156.5 | 1.036 |   49 |
+| textures_photo  | 153.5 |     147.7 | 1.040 |   20 |
+| photo_tecnick   | 245.4 |     234.3 | 1.048 |  100 |
+| pngimg          | 315.6 |     279.4 | 1.130 |  187 |
+| photo_kodak     | 165.7 |     146.3 | 1.133 |   24 |
+| screenshot_game | 336.8 |     293.8 | 1.146 |  618 |
+| textures_plants | 257.2 |     222.0 | 1.159 |   60 |
+| icon_64         | 266.2 |     224.9 | 1.184 |  213 |
+| icon_512        | 465.0 |     389.5 | 1.194 |  213 |
+| textures_pk02   | 187.0 |     155.3 | 1.203 |  235 |
+| textures_pk01   | 226.9 |     187.9 | 1.208 |  113 |
+| textures_pk     | 525.7 |     411.3 | 1.278 | 1002 |
+| screenshot_web  | 824.5 |     437.6 | 1.884 |   14 |
+| **overall**     | **357.0** | **297.5** | **1.200** | 2848 |
 
 ## The limit
 
@@ -342,8 +354,8 @@ bitstream is known only after the previous symbol's code length, so the Huffman
 table-load addresses form a dependent chain dominated by L1 load-use latency.
 Carrying shifted windows removes cumulative-count work from that chain, and
 delaying the fourth lookup reduces live-range pressure, but neither removes the
-load-use dependency. In the boost-disabled Ryzen 9950X3D follow-up, ffpng
-reaches 239.6 MP/s on `photo_tecnick`, 101.6% of image-png's measured 235.7
+load-use dependency. In the current boost-disabled Ryzen 9950X3D run, ffpng
+reaches 245.4 MP/s on `photo_tecnick`, 104.8% of image-png's measured 234.3
 MP/s, but that competitor ratio is not a hardware roofline. No port-pressure or
 load-latency roofline has been established, so further gains in this loop
 remain possible.
@@ -361,10 +373,10 @@ than the machine.
 ## Layout
 
 ```
-ffpng.c  ffpng.h    the decoder (one TU; libc + immintrin only)
+ffpng.h             single-header decoder (libc + immintrin only)
 ldpng.c             reference decoder: libdeflate's inflate, ffpng's front end
 bench.c             benchmark driver: registers decoders, times, checks output
-build.sh            builds the shim, then ffpng.o + ldpng.o + bench
+build.sh            builds the shim, then ldpng.o + bench
 analyze.py          per-category ratios from a bench CSV
 ext/image-png/      genuine image-rs/image-png, git submodule pinned at 4ab5484
 ext/shim/           Rust staticlib wrapping image-png for the C benchmark

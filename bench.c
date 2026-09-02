@@ -28,7 +28,9 @@
 #include <png.h>
 #include <spng.h>
 
+#define FFPNG_IMPLEMENTATION
 #include "ffpng.h"
+#undef FFPNG_IMPLEMENTATION
 
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wsign-compare"
