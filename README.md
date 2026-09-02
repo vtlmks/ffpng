@@ -1,5 +1,8 @@
 # ffpng
 
+ffpng is distributed as one file: **`ffpng.h`**. Download or copy that file into
+your project; no other file from this repository is needed.
+
 A from-scratch C PNG decoder for x86-64, built to beat `image-rs/image-png`, the
 Rust decoder behind the 2026 ["fastest PNG decoder in the world" post](https://blog.image-rs.org/2026/06/18/png-adoption.html). Over the
 whole QOI benchmark corpus it decodes about 1.12x faster than image-png by
@@ -13,10 +16,32 @@ samples, channels native to the color type, for every PNG color type and bit
 depth (palette, grayscale, RGB, RGBA, 1/2/4/8/16-bit, interlaced). Output is
 verified byte-for-byte against image-png on all 2848 corpus images.
 
-## How it works
+## Use ffpng
 
-The decoder is a single-header library, `ffpng.h`, using libc and
-`<immintrin.h>` only, with no third-party libraries.
+In exactly one C translation unit:
+
+```c
+#define FFPNG_IMPLEMENTATION
+#include "ffpng.h"
+```
+
+Other translation units can include `ffpng.h` normally for the declarations.
+The header requires a C99 compiler targeting x86-64-v3 and uses only libc and
+`<immintrin.h>`; it does not require libpng, zlib, Cargo, or anything else in
+this repository.
+
+To use a custom allocator, define all three allocation macros before the
+implementation:
+
+```c
+#define FFPNG_MALLOC(size) my_alloc(size)
+#define FFPNG_REALLOC(ptr, size) my_realloc(ptr, size)
+#define FFPNG_FREE(ptr) my_free(ptr)
+#define FFPNG_IMPLEMENTATION
+#include "ffpng.h"
+```
+
+## How it works
 
 **Inflate** is most of the work and is where the speed is won or lost. A 64-bit
 refill bit reader feeds a two-level Huffman scheme: a 9-bit direct table for
@@ -73,18 +98,10 @@ The per-category spread tracks how match-heavy the data is. Match-heavy data
 photographs are limited by the serial literal cascade. ffpng is ahead of
 image-png in both regimes, but by only about 3% on the two densest photo sets.
 
-## Build
+## Build the benchmark suite
 
-Include `ffpng.h` normally for its declarations. In exactly one translation
-unit, define `FFPNG_IMPLEMENTATION` first to emit the implementation:
-
-```c
-#define FFPNG_IMPLEMENTATION
-#include "ffpng.h"
-```
-
-The repository benchmark emits the implementation directly into its translation
-unit.
+The remaining files in this repository build and run the decoder comparisons;
+they are not part of the ffpng library.
 
 ```sh
 git submodule update --init     # fetch the image-png competitor

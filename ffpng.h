@@ -36,6 +36,16 @@ void pd_free_thread_cache(void);
 #include <string.h>
 #include <immintrin.h>
 
+#if defined(FFPNG_MALLOC) || defined(FFPNG_REALLOC) || defined(FFPNG_FREE)
+#if !defined(FFPNG_MALLOC) || !defined(FFPNG_REALLOC) || !defined(FFPNG_FREE)
+#error "FFPNG_MALLOC, FFPNG_REALLOC, and FFPNG_FREE must be defined together"
+#endif
+#else
+#define FFPNG_MALLOC(size) malloc(size)
+#define FFPNG_REALLOC(ptr, size) realloc(ptr, size)
+#define FFPNG_FREE(ptr) free(ptr)
+#endif
+
 // [=]===^=[ types ]===========================================================[=]
 
 struct bitreader {
@@ -170,8 +180,8 @@ static _Thread_local size_t raw_scratch_cap;
 // [=]===^=[ raw_grow ]========================================================[=]
 static uint8_t *raw_grow(size_t n) {
 	if(n > raw_scratch_cap) {
-		free(raw_scratch);
-		raw_scratch = malloc(n + COPY_PAD);
+		FFPNG_FREE(raw_scratch);
+		raw_scratch = FFPNG_MALLOC(n + COPY_PAD);
 		raw_scratch_cap = raw_scratch ? n : 0;
 	}
 	return raw_scratch;
@@ -1713,14 +1723,14 @@ int pd_decode(uint8_t *data, size_t len, struct pd_image *out) {
 		if(!(type[0] & 0x20)) {
 			uint32_t stored = (uint32_t)data[pos + 8 + clen] << 24 | (uint32_t)data[pos + 9 + clen] << 16 | (uint32_t)data[pos + 10 + clen] << 8 | data[pos + 11 + clen];
 			if(crc32_calc(type, clen + 4) != stored) {
-				free(idat);
+				FFPNG_FREE(idat);
 				return 1;
 			}
 		}
 
 		if(memcmp(type, "IHDR", 4) == 0) {
 			if(clen != 13) {
-				free(idat);
+				FFPNG_FREE(idat);
 				return 1;
 			}
 			width = (uint32_t)cdata[0] << 24 | (uint32_t)cdata[1] << 16 | (uint32_t)cdata[2] << 8 | cdata[3];
@@ -1732,7 +1742,7 @@ int pd_decode(uint8_t *data, size_t len, struct pd_image *out) {
 
 		} else if(memcmp(type, "PLTE", 4) == 0) {
 			if(clen > sizeof(plte)) {
-				free(idat);
+				FFPNG_FREE(idat);
 				return 1;
 			}
 			memcpy(plte, cdata, clen);
@@ -1744,9 +1754,9 @@ int pd_decode(uint8_t *data, size_t len, struct pd_image *out) {
 		} else if(memcmp(type, "IDAT", 4) == 0) {
 			if(idat_len + clen > idat_cap) {
 				idat_cap = (idat_len + clen) * 2;
-				uint8_t *grown = realloc(idat, idat_cap);
+				uint8_t *grown = FFPNG_REALLOC(idat, idat_cap);
 				if(!grown) {
-					free(idat);
+					FFPNG_FREE(idat);
 					return 1;
 				}
 				idat = grown;
@@ -1762,18 +1772,18 @@ int pd_decode(uint8_t *data, size_t len, struct pd_image *out) {
 	}
 
 	if(!have_ihdr || !saw_iend || width == 0 || height == 0) {
-		free(idat);
+		FFPNG_FREE(idat);
 		return 1;
 	}
 	if(interlace != 0 && interlace != 1) {
-		free(idat);
+		FFPNG_FREE(idat);
 		return 1;
 	}
 
 	uint32_t rch = raw_channels(ct);
 	uint32_t out_ch = output_channels(ct, (ct == 0 || ct == 2 || ct == 3) ? trns_len : 0);
 	if(rch == 0 || out_ch == 0) {
-		free(idat);
+		FFPNG_FREE(idat);
 		return 1;
 	}
 	uint32_t eff_trns = (ct == 0 || ct == 2 || ct == 3) ? trns_len : 0;
@@ -1793,9 +1803,9 @@ int pd_decode(uint8_t *data, size_t len, struct pd_image *out) {
 		pal32_ptr = pal32;
 	}
 
-	uint8_t *pixels = malloc((size_t)width * height * out_ch);
+	uint8_t *pixels = FFPNG_MALLOC((size_t)width * height * out_ch);
 	if(!pixels) {
-		free(idat);
+		FFPNG_FREE(idat);
 		return 1;
 	}
 
@@ -1804,20 +1814,20 @@ int pd_decode(uint8_t *data, size_t len, struct pd_image *out) {
 		size_t stride = row_bytes + 1;
 		size_t raw_size = stride * height;
 		uint32_t raw_owned = raw_size < RAW_REUSE_MIN;
-		uint8_t *raw = raw_owned ? malloc(raw_size + COPY_PAD) : raw_grow(raw_size);
+		uint8_t *raw = raw_owned ? FFPNG_MALLOC(raw_size + COPY_PAD) : raw_grow(raw_size);
 		struct sink sink = { raw, pixels, 0, plte, trns, pal32_ptr, stride, row_bytes, 0, height, width, bpp, bd, out_ch, eff_trns, ct };
 		struct sink *sp = raw_size > STREAM_MIN ? &sink : 0;
 		uint32_t big = raw_size >= BIG_MIN ? (raw_size / 5 < idat_len / 2 ? 2 : 1) : 0;
 		if(!raw || inflate_stream(idat, idat_len, raw, raw_size, big, sp) != 0 || sink_consume(&sink, raw_size, 0) != 0) {
 			if(raw_owned) {
-				free(raw);
+				FFPNG_FREE(raw);
 			}
-			free(idat);
-			free(pixels);
+			FFPNG_FREE(idat);
+			FFPNG_FREE(pixels);
 			return 1;
 		}
 		if(raw_owned) {
-			free(raw);
+			FFPNG_FREE(raw);
 		}
 
 	} else {
@@ -1838,16 +1848,16 @@ int pd_decode(uint8_t *data, size_t len, struct pd_image *out) {
 			}
 		}
 		uint32_t raw_owned = raw_size < RAW_REUSE_MIN;
-		uint8_t *raw = raw_owned ? malloc(raw_size + COPY_PAD) : raw_grow(raw_size);
-		uint8_t *temp = malloc((size_t)maxw * out_ch);
+		uint8_t *raw = raw_owned ? FFPNG_MALLOC(raw_size + COPY_PAD) : raw_grow(raw_size);
+		uint8_t *temp = FFPNG_MALLOC((size_t)maxw * out_ch);
 		uint32_t big = raw_size >= BIG_MIN ? (raw_size / 5 < idat_len / 2 ? 2 : 1) : 0;
 		if(!raw || !temp || inflate_stream(idat, idat_len, raw, raw_size, big, 0) != 0) {
 			if(raw_owned) {
-				free(raw);
+				FFPNG_FREE(raw);
 			}
-			free(temp);
-			free(idat);
-			free(pixels);
+			FFPNG_FREE(temp);
+			FFPNG_FREE(idat);
+			FFPNG_FREE(pixels);
 			return 1;
 		}
 		uint32_t ok = 1;
@@ -1870,17 +1880,17 @@ int pd_decode(uint8_t *data, size_t len, struct pd_image *out) {
 				}
 			}
 		}
-		free(temp);
+		FFPNG_FREE(temp);
 		if(raw_owned) {
-			free(raw);
+			FFPNG_FREE(raw);
 		}
 		if(!ok) {
-			free(idat);
-			free(pixels);
+			FFPNG_FREE(idat);
+			FFPNG_FREE(pixels);
 			return 1;
 		}
 	}
-	free(idat);
+	FFPNG_FREE(idat);
 
 	out->pixels = pixels;
 	out->width = width;
@@ -1891,13 +1901,13 @@ int pd_decode(uint8_t *data, size_t len, struct pd_image *out) {
 
 // [=]===^=[ pd_free ]========================================================[=]
 void pd_free(struct pd_image *img) {
-	free(img->pixels);
+	FFPNG_FREE(img->pixels);
 	img->pixels = 0;
 }
 
 // [=]===^=[ pd_free_thread_cache ]============================================[=]
 void pd_free_thread_cache(void) {
-	free(raw_scratch);
+	FFPNG_FREE(raw_scratch);
 	raw_scratch = 0;
 	raw_scratch_cap = 0;
 }
