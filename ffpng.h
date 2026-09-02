@@ -1704,20 +1704,23 @@ int pd_decode(uint8_t *data, size_t len, struct pd_image *out) {
 	uint32_t interlace = 0;
 	uint8_t plte[256 * 3];
 	uint8_t trns[256];
+	uint32_t plte_len = 0;
 	uint32_t trns_len = 0;
 	uint32_t have_ihdr = 0;
+	uint32_t have_idat = 0;
 
 	uint8_t *idat = 0;
 	size_t idat_len = 0, idat_cap = 0;
 
 	size_t pos = 8;
 	uint32_t saw_iend = 0;
-	while(pos + 8 <= len) {
+	while(pos <= len && len - pos >= 8) {
 		uint32_t clen = (uint32_t)data[pos] << 24 | (uint32_t)data[pos + 1] << 16 | (uint32_t)data[pos + 2] << 8 | data[pos + 3];
 		uint8_t *type = data + pos + 4;
-		if(pos + 12 + clen > len) {
+		if((clen & 0x80000000u) || len - pos < 12 || (size_t)clen > len - pos - 12) {
 			break;
 		}
+		size_t chunk_size = (size_t)clen + 12;
 		uint8_t *cdata = data + pos + 8;
 		// Ancillary CRC failures are tolerated to match image-png's skip_ancillary_crc_failures behavior.
 		if(!(type[0] & 0x20)) {
@@ -1729,7 +1732,7 @@ int pd_decode(uint8_t *data, size_t len, struct pd_image *out) {
 		}
 
 		if(memcmp(type, "IHDR", 4) == 0) {
-			if(clen != 13) {
+			if(clen != 13 || have_ihdr || pos != 8) {
 				FFPNG_FREE(idat);
 				return 1;
 			}
@@ -1738,22 +1741,45 @@ int pd_decode(uint8_t *data, size_t len, struct pd_image *out) {
 			bd = cdata[8];
 			ct = cdata[9];
 			interlace = cdata[12];
+			uint32_t valid_format = (ct == 0 && (bd == 1 || bd == 2 || bd == 4 || bd == 8 || bd == 16)) || (ct == 2 && (bd == 8 || bd == 16)) || (ct == 3 && (bd == 1 || bd == 2 || bd == 4 || bd == 8)) || (ct == 4 && (bd == 8 || bd == 16)) || (ct == 6 && (bd == 8 || bd == 16));
+			if(width > 0x7fffffffu || height > 0x7fffffffu || !valid_format || cdata[10] != 0 || cdata[11] != 0) {
+				FFPNG_FREE(idat);
+				return 1;
+			}
 			have_ihdr = 1;
 
 		} else if(memcmp(type, "PLTE", 4) == 0) {
-			if(clen > sizeof(plte)) {
+			if(!have_ihdr || have_idat || plte_len || clen == 0 || clen > sizeof(plte) || clen % 3 != 0 || ct == 0 || ct == 4 || (ct == 3 && clen / 3 > (1u << bd))) {
 				FFPNG_FREE(idat);
 				return 1;
 			}
 			memcpy(plte, cdata, clen);
+			plte_len = clen;
 
 		} else if(memcmp(type, "tRNS", 4) == 0) {
-			trns_len = clen > sizeof(trns) ? sizeof(trns) : clen;
+			uint32_t valid_trns = (ct == 0 && clen == 2) || (ct == 2 && clen == 6) || (ct == 3 && plte_len && clen > 0 && clen <= plte_len / 3);
+			if(!have_ihdr || have_idat || trns_len || !valid_trns) {
+				FFPNG_FREE(idat);
+				return 1;
+			}
+			trns_len = clen;
 			memcpy(trns, cdata, trns_len);
 
 		} else if(memcmp(type, "IDAT", 4) == 0) {
-			if(idat_len + clen > idat_cap) {
-				idat_cap = (idat_len + clen) * 2;
+			if(!have_ihdr || (ct == 3 && !plte_len)) {
+				FFPNG_FREE(idat);
+				return 1;
+			}
+			have_idat = 1;
+			size_t needed;
+			if(__builtin_add_overflow(idat_len, (size_t)clen, &needed)) {
+				FFPNG_FREE(idat);
+				return 1;
+			}
+			if(needed > idat_cap) {
+				if(__builtin_mul_overflow(needed, (size_t)2, &idat_cap)) {
+					idat_cap = needed;
+				}
 				uint8_t *grown = FFPNG_REALLOC(idat, idat_cap);
 				if(!grown) {
 					FFPNG_FREE(idat);
@@ -1762,16 +1788,20 @@ int pd_decode(uint8_t *data, size_t len, struct pd_image *out) {
 				idat = grown;
 			}
 			memcpy(idat + idat_len, cdata, clen);
-			idat_len += clen;
+			idat_len = needed;
 
 		} else if(memcmp(type, "IEND", 4) == 0) {
+			if(clen != 0 || !have_idat) {
+				FFPNG_FREE(idat);
+				return 1;
+			}
 			saw_iend = 1;
 			break;
 		}
-		pos += 12 + clen;
+		pos += chunk_size;
 	}
 
-	if(!have_ihdr || !saw_iend || width == 0 || height == 0) {
+	if(!have_ihdr || !have_idat || !saw_iend || (ct == 3 && !plte_len) || width == 0 || height == 0) {
 		FFPNG_FREE(idat);
 		return 1;
 	}
@@ -1779,7 +1809,6 @@ int pd_decode(uint8_t *data, size_t len, struct pd_image *out) {
 		FFPNG_FREE(idat);
 		return 1;
 	}
-
 	uint32_t rch = raw_channels(ct);
 	uint32_t out_ch = output_channels(ct, (ct == 0 || ct == 2 || ct == 3) ? trns_len : 0);
 	if(rch == 0 || out_ch == 0) {
@@ -1793,6 +1822,67 @@ int pd_decode(uint8_t *data, size_t len, struct pd_image *out) {
 		bpp = 1;
 	}
 
+	size_t pixel_count;
+	size_t pixel_size;
+	if(__builtin_mul_overflow((size_t)width, (size_t)height, &pixel_count) || __builtin_mul_overflow(pixel_count, (size_t)out_ch, &pixel_size)) {
+		FFPNG_FREE(idat);
+		return 1;
+	}
+
+	uint32_t pw[7] = { 0 };
+	uint32_t ph[7] = { 0 };
+	size_t prb[7] = { 0 };
+	size_t poff[7] = { 0 };
+	size_t row_bytes = 0;
+	size_t stride = 0;
+	size_t raw_size = 0;
+	size_t temp_size = 0;
+	if(interlace == 0) {
+		size_t row_bits;
+		if(__builtin_mul_overflow((size_t)width, bits_per_pixel, &row_bits) || __builtin_add_overflow(row_bits, (size_t)7, &row_bits)) {
+			FFPNG_FREE(idat);
+			return 1;
+		}
+		row_bytes = row_bits / 8;
+		if(__builtin_add_overflow(row_bytes, (size_t)1, &stride) || __builtin_mul_overflow(stride, (size_t)height, &raw_size)) {
+			FFPNG_FREE(idat);
+			return 1;
+		}
+
+	} else {
+		uint32_t maxw = 0;
+		for(uint32_t p = 0; p < 7; ++p) {
+			pw[p] = width > a7_xorig[p] ? (width - a7_xorig[p] + a7_xstep[p] - 1) / a7_xstep[p] : 0;
+			ph[p] = height > a7_yorig[p] ? (height - a7_yorig[p] + a7_ystep[p] - 1) / a7_ystep[p] : 0;
+			size_t pass_bits;
+			if(__builtin_mul_overflow((size_t)pw[p], bits_per_pixel, &pass_bits) || __builtin_add_overflow(pass_bits, (size_t)7, &pass_bits)) {
+				FFPNG_FREE(idat);
+				return 1;
+			}
+			prb[p] = pass_bits / 8;
+			poff[p] = raw_size;
+			if(pw[p] && ph[p]) {
+				size_t pass_stride;
+				size_t pass_size;
+				if(__builtin_add_overflow(prb[p], (size_t)1, &pass_stride) || __builtin_mul_overflow(pass_stride, (size_t)ph[p], &pass_size) || __builtin_add_overflow(raw_size, pass_size, &raw_size)) {
+					FFPNG_FREE(idat);
+					return 1;
+				}
+			}
+			if(pw[p] > maxw) {
+				maxw = pw[p];
+			}
+		}
+		if(__builtin_mul_overflow((size_t)maxw, (size_t)out_ch, &temp_size)) {
+			FFPNG_FREE(idat);
+			return 1;
+		}
+	}
+	if(raw_size > SIZE_MAX - COPY_PAD || raw_size > SIZE_MAX - STREAM_CHUNK) {
+		FFPNG_FREE(idat);
+		return 1;
+	}
+
 	uint32_t pal32[256];
 	uint32_t *pal32_ptr = 0;
 	if(ct == 3 && bd == 8) {
@@ -1803,16 +1893,13 @@ int pd_decode(uint8_t *data, size_t len, struct pd_image *out) {
 		pal32_ptr = pal32;
 	}
 
-	uint8_t *pixels = FFPNG_MALLOC((size_t)width * height * out_ch);
+	uint8_t *pixels = FFPNG_MALLOC(pixel_size);
 	if(!pixels) {
 		FFPNG_FREE(idat);
 		return 1;
 	}
 
 	if(interlace == 0) {
-		size_t row_bytes = (width * bits_per_pixel + 7) / 8;
-		size_t stride = row_bytes + 1;
-		size_t raw_size = stride * height;
 		uint32_t raw_owned = raw_size < RAW_REUSE_MIN;
 		uint8_t *raw = raw_owned ? FFPNG_MALLOC(raw_size + COPY_PAD) : raw_grow(raw_size);
 		struct sink sink = { raw, pixels, 0, plte, trns, pal32_ptr, stride, row_bytes, 0, height, width, bpp, bd, out_ch, eff_trns, ct };
@@ -1831,25 +1918,9 @@ int pd_decode(uint8_t *data, size_t len, struct pd_image *out) {
 		}
 
 	} else {
-		uint32_t pw[7], ph[7];
-		size_t prb[7], poff[7];
-		size_t raw_size = 0;
-		uint32_t maxw = 0;
-		for(uint32_t p = 0; p < 7; ++p) {
-			pw[p] = width > a7_xorig[p] ? (width - a7_xorig[p] + a7_xstep[p] - 1) / a7_xstep[p] : 0;
-			ph[p] = height > a7_yorig[p] ? (height - a7_yorig[p] + a7_ystep[p] - 1) / a7_ystep[p] : 0;
-			prb[p] = (pw[p] * bits_per_pixel + 7) / 8;
-			poff[p] = raw_size;
-			if(pw[p] && ph[p]) {
-				raw_size += (prb[p] + 1) * (size_t)ph[p];
-			}
-			if(pw[p] > maxw) {
-				maxw = pw[p];
-			}
-		}
 		uint32_t raw_owned = raw_size < RAW_REUSE_MIN;
 		uint8_t *raw = raw_owned ? FFPNG_MALLOC(raw_size + COPY_PAD) : raw_grow(raw_size);
-		uint8_t *temp = FFPNG_MALLOC((size_t)maxw * out_ch);
+		uint8_t *temp = FFPNG_MALLOC(temp_size);
 		uint32_t big = raw_size >= BIG_MIN ? (raw_size / 5 < idat_len / 2 ? 2 : 1) : 0;
 		if(!raw || !temp || inflate_stream(idat, idat_len, raw, raw_size, big, 0) != 0) {
 			if(raw_owned) {
